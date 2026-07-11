@@ -1,0 +1,5 @@
+{
+  "snapshot": {"instrument":"BTC-USDT-SWAP","price":60000,"updatedAt":"2026-01-01T00:00:00Z","stale":false,"candles1h":[],"candles4h":[],"fundingRate":0.0001,"fundingTime":1767225600000,"openInterest":1234,"openInterestTime":1767225600000,"connectionStatus":"connected"},
+  "advice": {"instrument":"BTC-USDT-SWAP","strategy":"trend","candleCloseAt":1767225600000,"regime":"TREND","action":"WATCH_LONG","directionScore":42,"confidence":67,"contributions":[{"name":"EMA","score":15,"value":1.2,"explanation":"短均线位于长均线上方"}],"triggerPrice":60100,"invalidation":"收盘跌破 EMA50","stopLoss":59000,"targets":[61200,62300],"riskReward":[1,2],"explanation":"趋势偏多但尚未突破","dataQuality":{"fresh":true,"lastCandleAt":1767225600000,"fundingAvailable":true,"openInterestAvailable":true,"warnings":[]},"configVersion":"validated-v1","createdAt":"2026-01-01T00:00:01Z"},
+  "settings": {"equity":null,"riskPercent":null,"leverage":null,"notificationsEnabled":false,"feeBps":5,"slippageBps":5,"customParameters":{}}
+}
