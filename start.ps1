@@ -7,6 +7,19 @@ param(
 $ErrorActionPreference = 'Stop'
 $ProjectRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 Set-Location $ProjectRoot
+$url = "http://127.0.0.1:$Port"
+
+try {
+    $health = Invoke-WebRequest "$url/api/health" -UseBasicParsing -TimeoutSec 1
+    if ($health.StatusCode -eq 200) {
+        Write-Host "OKX BTC Advisor is already running at $url" -ForegroundColor Green
+        if (-not $NoBrowser) { Start-Process $url }
+        exit 0
+    }
+}
+catch {
+    # No existing local service; continue with normal startup.
+}
 
 function Resolve-Tool {
     param([string]$Name, [string[]]$Candidates)
@@ -53,7 +66,6 @@ if (-not $SkipInstall) {
     }
 }
 
-$url = "http://127.0.0.1:$Port"
 Write-Host "OKX BTC Advisor starting at $url" -ForegroundColor Cyan
 Write-Host 'Press Ctrl+C to stop. Public market data only; no trading access.' -ForegroundColor Yellow
 
