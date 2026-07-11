@@ -22,7 +22,7 @@ def test_regime_threshold_trending():
 
 def test_signal_close_and_no_future_funding():
     c1=candles(250,start=1_600_000_000_000+900*3600_000);c4=candles(250,"4H")
-    future=(c1[-1].timestamp+1000,.5)
+    future=(c1[-1].timestamp+3600_000+1000,.5)
     a=analyze(c1,c4,[future],now_ms=c1[-1].timestamp+3600_000)
     assert a.candle_close_at==c1[-1].timestamp+3600_000
     assert not a.data_quality.funding_available
@@ -38,3 +38,18 @@ def test_risk_bounds_and_calculation():
     a=SignalAdvice(strategy="trend",candle_close_at=1,regime=MarketRegime.TREND,action=AdviceAction.LONG_CANDIDATE,direction_score=60,confidence=70,trigger_price=100,stop_loss=95,invalidation="x",explanation="x",data_quality=DataQuality(fresh=True))
     r=estimate_risk(a,Settings(equity=10000,risk_percent=1,leverage=2))
     assert r.stop_distance==5 and r.quantity_btc==20 and r.reference_notional==2000
+
+
+def test_news_adjustment_is_capped_and_separate():
+    c1=candles(250,start=1_600_000_000_000+900*3600_000);c4=candles(250,"4H")
+    a=analyze(c1,c4,now_ms=c1[-1].timestamp+3600_000,news_analysis={"status":"fresh","score":99,"items":[]})
+    assert -85<=a.technical_score<=85
+    assert a.news_score==15
+    assert a.direction_score==min(100,a.technical_score+a.news_score)
+    assert a.config_version=="research-v2-unvalidated"
+
+
+def test_news_cannot_create_signal_without_technical_setup():
+    c1=candles(219);c4=candles(199,"4H")
+    a=analyze(c1,c4,now_ms=c1[-1].timestamp+3600_000,news_analysis={"status":"fresh","score":15,"items":[]})
+    assert a.action==AdviceAction.WAIT and a.news_score==0

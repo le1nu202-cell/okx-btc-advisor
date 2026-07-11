@@ -72,3 +72,40 @@ def adx(high,low,close,period=14)->np.ndarray:
     with np.errstate(divide="ignore",invalid="ignore"):
         p=100*wilder(plus[1:],period)/a[1:]; m=100*wilder(minus[1:],period)/a[1:]; dx=100*np.abs(p-m)/(p+m)
     out=np.full(len(c),np.nan); out[1:]=wilder(dx,period); return out
+
+
+def stochastic_rsi(values, rsi_period=14, stoch_period=14, smooth_k=3, smooth_d=3):
+    """Return Stochastic RSI %K and %D in the 0..100 range."""
+    rr=rsi(values,rsi_period); raw=np.full(len(rr),np.nan)
+    for i in range(stoch_period-1,len(rr)):
+        window=rr[i-stoch_period+1:i+1]
+        if np.isnan(window).any():continue
+        lo,hi=float(np.min(window)),float(np.max(window))
+        raw[i]=50.0 if hi==lo else 100.0*(rr[i]-lo)/(hi-lo)
+    valid=np.where(~np.isnan(raw))[0]; k=np.full(len(rr),np.nan); d=np.full(len(rr),np.nan)
+    if len(valid)>=smooth_k:
+        kv=sma(raw[valid],smooth_k);k[valid]=kv
+        kval=np.where(~np.isnan(k))[0]
+        if len(kval)>=smooth_d:d[kval]=sma(k[kval],smooth_d)
+    return k,d
+
+
+def money_flow_index(high,low,close,volume,period=14)->np.ndarray:
+    """Volume-weighted momentum oscillator in the 0..100 range."""
+    h,l,c,v=map(_a,(high,low,close,volume));typical=(h+l+c)/3
+    flow=typical*v;delta=np.diff(typical,prepend=np.nan)
+    positive=np.where(delta>0,flow,0.0);negative=np.where(delta<0,flow,0.0)
+    out=np.full(len(c),np.nan)
+    for i in range(period,len(c)):
+        pos=float(np.sum(positive[i-period+1:i+1]));neg=float(np.sum(negative[i-period+1:i+1]))
+        out[i]=50.0 if pos==0 and neg==0 else 100.0 if neg==0 else 100.0-(100.0/(1.0+pos/neg))
+    return out
+
+
+def williams_r(high,low,close,period=14)->np.ndarray:
+    """Williams %R oscillator in the -100..0 range."""
+    h,l,c=map(_a,(high,low,close));out=np.full(len(c),np.nan)
+    for i in range(period-1,len(c)):
+        hh=float(np.max(h[i-period+1:i+1]));ll=float(np.min(l[i-period+1:i+1]))
+        out[i]=-50.0 if hh==ll else -100.0*(hh-c[i])/(hh-ll)
+    return out

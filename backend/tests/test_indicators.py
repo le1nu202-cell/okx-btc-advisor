@@ -1,6 +1,6 @@
 import numpy as np
 
-from backend.indicators import adx, atr, bollinger, ema, obv, rsi
+from backend.indicators import adx, atr, bollinger, ema, money_flow_index, obv, rsi, stochastic_rsi, williams_r
 
 
 def test_ema_fixed_vector():
@@ -29,3 +29,19 @@ def test_bollinger_and_obv():
 def test_adx_trend_is_high():
     close=np.arange(1,80,dtype=float); got=adx(close+1,close-1,close)
     assert got[-1]>90
+
+
+def test_advanced_oscillators_are_bounded():
+    close=100+np.sin(np.arange(120)/5)*8+np.arange(120)*.05
+    high=close+1;low=close-1;volume=1000+np.arange(120)*3
+    k,d=stochastic_rsi(close)
+    mfi=money_flow_index(high,low,close,volume)
+    wr=williams_r(high,low,close)
+    assert 0<=k[-1]<=100 and 0<=d[-1]<=100
+    assert 0<=mfi[-1]<=100
+    assert -100<=wr[-1]<=0
+
+
+def test_money_flow_flat_zero_volume_is_neutral():
+    values=np.ones(40)*100;volume=np.zeros(40)
+    assert money_flow_index(values+1,values-1,values,volume)[-1]==50

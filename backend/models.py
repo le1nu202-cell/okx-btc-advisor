@@ -64,6 +64,9 @@ class SignalAdvice(APIModel):
     regime: MarketRegime
     action: AdviceAction
     direction_score: float = Field(ge=-100, le=100)
+    technical_score: float = Field(default=0, ge=-85, le=85)
+    news_score: float = Field(default=0, ge=-15, le=15)
+    news_analysis: dict[str, Any] | None = None
     confidence: float = Field(ge=0, le=100)
     contributions: list[IndicatorContribution] = Field(default_factory=list)
     trigger_price: float | None = None

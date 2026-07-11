@@ -22,6 +22,8 @@ CREATE TABLE IF NOT EXISTS open_interest (instrument TEXT NOT NULL, ts INTEGER N
 CREATE TABLE IF NOT EXISTS signals (dedupe_key TEXT PRIMARY KEY, candle_ts INTEGER NOT NULL, payload TEXT NOT NULL, created_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS settings (id INTEGER PRIMARY KEY CHECK(id=1), payload TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS backtests (id TEXT PRIMARY KEY, status TEXT NOT NULL, progress REAL NOT NULL, message TEXT NOT NULL, payload TEXT);
+CREATE TABLE IF NOT EXISTS news_items (id TEXT PRIMARY KEY, url TEXT UNIQUE NOT NULL, published_at INTEGER NOT NULL, observed_at INTEGER NOT NULL, payload TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS idx_news_published ON news_items(published_at DESC);
 """
 
 
@@ -95,6 +97,20 @@ class Database:
         with self.connect() as con: r=con.execute("SELECT * FROM backtests WHERE id=?",(id,)).fetchone()
         return dict(r) if r else None
 
+    def upsert_news(self, items: Iterable[dict]) -> int:
+        rows=[]
+        for item in items:
+            rows.append((str(item["id"]),str(item["url"]),int(item["publishedAt"]),int(item["observedAt"]),json.dumps(item,ensure_ascii=False)))
+        with self._lock, self.connect() as con:
+            con.executemany("INSERT INTO news_items VALUES(?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET url=excluded.url,published_at=excluded.published_at,observed_at=MIN(news_items.observed_at,excluded.observed_at),payload=excluded.payload",rows)
+        return len(rows)
+
+    def news_items(self, limit:int=50, decision_at:int|None=None, since:int=0) -> list[dict]:
+        cutoff=decision_at if decision_at is not None else 9_999_999_999_999
+        with self.connect() as con:
+            rows=con.execute("SELECT payload FROM news_items WHERE published_at<=? AND observed_at<=? AND published_at>=? ORDER BY published_at DESC LIMIT ?",(cutoff,cutoff,since,limit)).fetchall()
+        return [json.loads(r[0]) for r in rows]
+
     def clear_local_data(self) -> None:
         with self._lock, self.connect() as con:
-            for table in ("candles","funding","open_interest","signals","settings","backtests"): con.execute(f"DELETE FROM {table}")
+            for table in ("candles","funding","open_interest","signals","settings","backtests","news_items"): con.execute(f"DELETE FROM {table}")

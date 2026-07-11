@@ -24,3 +24,12 @@ def test_okx_parse_dedupe_confirm():
 def test_backtest_insufficient_is_not_validated():
     out=run_backtest([c(i) for i in range(10)],[c(i) for i in range(10)],[])
     assert out["validationPass"] is False
+
+
+def test_news_point_in_time_cutoff_and_clear(tmp_path):
+    db=Database(tmp_path/"news.db")
+    db.upsert_news([{"id":"n1","url":"https://example.com/n1","publishedAt":1000,"observedAt":1500,"title":"Bitcoin event","source":"test","relevance":1}])
+    assert db.news_items(decision_at=1499)==[]
+    assert len(db.news_items(decision_at=1500))==1
+    db.clear_local_data()
+    assert db.news_items()==[]

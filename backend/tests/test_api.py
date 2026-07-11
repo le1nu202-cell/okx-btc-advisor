@@ -20,3 +20,11 @@ def test_settings_validation_and_camel_case():
         r=client.put("/api/settings",json={"equity":1000,"riskPercent":1,"leverage":2,"notificationsEnabled":True})
         assert r.status_code==200 and r.json()["riskPercent"]==1
         assert client.put("/api/settings",json={"riskPercent":3}).status_code==422
+
+
+def test_technical_and_news_modules_degrade_independently():
+    with TestClient(app) as client:
+        technical=client.get("/api/technical/summary")
+        news=client.get("/api/news?limit=5")
+        assert technical.status_code==200 and technical.json()["status"]=="unavailable"
+        assert news.status_code==200 and news.json()["analysis"]["status"]=="unavailable"
