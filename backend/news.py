@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import math
 import re
 import unicodedata
@@ -307,11 +308,20 @@ class NewsAggregator:
             headers = {"Accept": "application/json" if source == "okx" else "application/rss+xml, application/xml",
                        "Accept-Language": "zh-CN" if source == "okx" else "en-US",
                        "User-Agent": "okx-btc-advisor/1.0 (local educational analysis)"}
-            response = await client.get(SOURCES[source], headers=headers, timeout=self.timeout, follow_redirects=True)
-            response.raise_for_status()
-            if len(response.content) > 2_000_000:
-                raise ValueError("response exceeds 2 MB")
-            parsed = parse_okx(response.json(), observed) if source == "okx" else parse_rss(source, response.content, observed)
+            expected_host=(urlsplit(SOURCES[source]).hostname or "").lower()
+            content=bytearray()
+            async with client.stream("GET",SOURCES[source],headers=headers,timeout=self.timeout,follow_redirects=True) as response:
+                response.raise_for_status()
+                if (response.url.host or "").lower()!=expected_host:
+                    raise ValueError("news redirect left the configured source host")
+                length=response.headers.get("content-length")
+                if length and int(length)>2_000_000:
+                    raise ValueError("response exceeds 2 MB")
+                async for chunk in response.aiter_bytes():
+                    content.extend(chunk)
+                    if len(content)>2_000_000:
+                        raise ValueError("response exceeds 2 MB")
+            parsed = parse_okx(json.loads(content), observed) if source == "okx" else parse_rss(source, content, observed)
             return parsed, {"source": source, "ok": True, "itemCount": len(parsed), "observedAt": _iso(observed), "error": None}
         except (httpx.HTTPError, ValueError, ElementTree.ParseError) as exc:
             return [], {"source": source, "ok": False, "itemCount": 0, "observedAt": _iso(observed),
@@ -325,7 +335,11 @@ class NewsAggregator:
             statuses = [status for _, status in results]
             # A normal live call uses a cutoff after observation. An explicit cutoff remains strict for audit/backtests.
             effective_cutoff = cutoff if cutoff is not None else _utc_now()
-            return aggregate_news(items, effective_cutoff, statuses)
+            result = aggregate_news(items, effective_cutoff, statuses)
+            # Persist immutable source articles, never the dynamic clusters whose ids can
+            # change as corroborating publishers enter or leave a feed window.
+            result["rawItems"] = items
+            return result
         if self.client is not None:
             return await run(self.client)
         async with httpx.AsyncClient() as client:

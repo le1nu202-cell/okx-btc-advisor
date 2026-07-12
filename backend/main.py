@@ -8,7 +8,7 @@ import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import BackgroundTasks, FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
@@ -25,9 +25,14 @@ INSTRUMENT="BTC-USDT-SWAP"
 ROOT=Path(__file__).resolve().parents[1]
 db=Database(os.getenv("OKX_ADVISOR_DB",str(Path(__file__).with_name("data")/"advisor.db")))
 client=OKXPublicClient(base_url=os.getenv("OKX_BASE_URL","https://www.okx.com"),ws_url=os.getenv("OKX_WS_URL","wss://ws.okx.com:8443/ws/v5/public"))
-runtime={"price":None,"ticker_ts":None,"connection":"starting","stop":None,"task":None,"bootstrap_task":None,"news_task":None,"news":{"items":[],"analysis":{"asOf":None,"windowHours":48,"score":0,"articleCount":0,"status":"unavailable","warnings":["新闻源正在连接"]}},"news_source_status":[]}
+def _empty_news(message="新闻源正在连接"):
+    return {"items":[],"analysis":{"asOf":None,"windowHours":48,"score":0,"articleCount":0,"status":"unavailable","warnings":[message]}}
+
+
+runtime={"price":None,"ticker_ts":None,"connection":"starting","stop":None,"task":None,"bootstrap_task":None,"news_task":None,"backtest_tasks":set(),"news":_empty_news(),"news_source_status":[]}
 subscribers:set[WebSocket]=set()
 news_aggregator=NewsAggregator()
+backtest_lock=asyncio.Lock()
 
 
 def _epoch_ms(value):
@@ -68,11 +73,20 @@ def technical_summary():
     groups=[]
     for key,label in labels.items():
         score=raw.get("group_scores",{}).get(key,0);cap=raw.get("group_caps",{}).get(key,0)
-        groups.append({"key":key,"label":label,"rating1h":ratings[0],"rating4h":ratings[1],"summary":f"分组贡献 {score:+.1f} / {cap:.0f}","metrics":[{"label":"贡献分","value":f"{score:+.1f}","tone":"positive" if score>0 else "negative" if score<0 else "neutral"}]})
+        groups.append({"key":key,"label":label,"score":score,"cap":cap,"rating1h":ratings[0],"rating4h":ratings[1],"summary":f"分组贡献 {score:+.1f} / {cap:.0f}","metrics":[{"label":"贡献分","value":f"{score:+.1f}","tone":"positive" if score>0 else "negative" if score<0 else "neutral"}]})
     levels=raw.get("levels",{});vp=levels.get("volume_profile",{});flow=raw.get("volume_price",{});momentum=raw.get("momentum",{});vol=raw.get("volatility",{})
+    group_metrics={
+        "trend":[{"label":"1H / 4H评级","value":f"{ratings[0]} / {ratings[1]}","tone":"neutral"}],
+        "structure":[{"label":"支撑 / 阻力","value":f"{levels.get('donchian_support','—')} / {levels.get('donchian_resistance','—')}","tone":"neutral"}],
+        "volume_price":[{"label":"日 / 周VWAP","value":f"{flow.get('daily_vwap','—')} / {flow.get('weekly_vwap','—')}","tone":"neutral"},{"label":"MFI","value":str(flow.get('mfi','—')),"tone":"neutral"}],
+        "momentum":[{"label":"RSI / Stoch / %R","value":f"{momentum.get('rsi','—')} / {momentum.get('stoch_rsi','—')} / {momentum.get('williams_r','—')}","tone":"neutral"}],
+        "volatility":[{"label":"ATR / BB分位","value":f"{vol.get('atr_percentile','—')}% / {vol.get('bollinger_width_percentile','—')}%","tone":"neutral"}],
+    }
+    for group in groups:group["metrics"].extend(group_metrics.get(group["key"],[]))
     warnings=[*raw.get("warnings",[]),*raw.get("conflicts",[]),*raw.get("risk_overlay",{}).get("reasons",[])]
     phase={"COMPRESSION":"波动压缩","NORMAL":"正常波动","EXPANSION":"波动扩张","EXTREME":"极端波动","UNKNOWN":"数据不足"}.get(vol.get("phase"),str(vol.get("phase","数据不足")))
-    return {"asOf":raw.get("as_of",0)+3600_000 if raw.get("as_of") else None,"status":"fresh" if raw.get("ready") else "unavailable","technicalScore":raw.get("technical_score",0),"groups":groups,"vwap":flow.get("daily_vwap"),"weeklyVwap":flow.get("weekly_vwap"),"volumeProfile":vp,"supportResistance":{"supports":[levels["donchian_support"]] if levels.get("donchian_support") is not None else [],"resistances":[levels["donchian_resistance"]] if levels.get("donchian_resistance") is not None else []},"momentum":f"RSI {momentum.get('rsi','—')} · Stoch RSI {momentum.get('stoch_rsi','—')} · Williams %R {momentum.get('williams_r','—')}","volatilityPhase":phase,"volatility":vol,"riskOverlay":raw.get("risk_overlay",{}),"warnings":warnings}
+    risk=raw.get("risk_overlay",{})
+    return {"asOf":raw.get("as_of",0)+3600_000 if raw.get("as_of") else None,"status":"fresh" if raw.get("ready") else "unavailable","algorithmId":"aux-confluence-v2","technicalScore":raw.get("technical_score",0),"groups":groups,"vwap":flow.get("daily_vwap"),"weeklyVwap":flow.get("weekly_vwap"),"mfi":flow.get("mfi"),"volumeProfile":vp,"supportResistance":{"supports":[levels["donchian_support"]] if levels.get("donchian_support") is not None else [],"resistances":[levels["donchian_resistance"]] if levels.get("donchian_resistance") is not None else []},"momentum":f"RSI {momentum.get('rsi','—')} · Stoch RSI {momentum.get('stoch_rsi','—')} · Williams %R {momentum.get('williams_r','—')}","volatilityPhase":phase,"atrPercentile":vol.get("atr_percentile"),"bollingerWidthPercentile":vol.get("bollinger_width_percentile"),"volatility":vol,"positionScale":risk.get("position_scale"),"riskReasons":risk.get("reasons",[]),"riskOverlay":risk,"warnings":warnings}
 
 
 async def broadcast(payload:dict):
@@ -84,6 +98,12 @@ async def broadcast(payload:dict):
 
 
 async def on_okx(msg:dict):
+    if msg.get("event")=="reconnecting":
+        runtime["connection"]="reconnecting"
+        await broadcast({"type":"market","price":runtime["price"],"tickerTime":runtime["ticker_ts"],"connectionStatus":runtime["connection"]})
+        return
+    if msg.get("event")=="message_error":
+        return
     if msg.get("event")=="reconnected":
         # Fill any gap accumulated while the public stream was disconnected.
         for tf in ("1H","4H"):
@@ -125,7 +145,12 @@ async def news_loop():
     while True:
         try:
             raw=await news_aggregator.fetch();runtime["news_source_status"]=raw.get("sourceStatus",[])
-            public=_public_news(raw);db.upsert_news(public["items"]);runtime["news"]=public
+            db.upsert_news(raw.get("rawItems",[]))
+            candles=db.candles(INSTRUMENT,"1H",1,True)
+            # The panel and strategy use the same point-in-time decision cutoff. News first
+            # observed after the current candle closed remains visible only after the next close.
+            runtime["news"]=news_for_decision(candles[-1].timestamp+3600_000) if candles else _public_news(raw)
+            public=runtime["news"]
             await broadcast({"type":"news","analysis":public["analysis"]})
         except Exception as exc:
             runtime["news"]["analysis"]["status"]="unavailable"
@@ -141,9 +166,9 @@ async def lifespan(app:FastAPI):
         runtime["news_task"]=asyncio.create_task(news_loop())
     yield
     if runtime["stop"]:runtime["stop"].set()
-    if runtime["task"]:runtime["task"].cancel()
-    if runtime["bootstrap_task"]:runtime["bootstrap_task"].cancel()
-    if runtime["news_task"]:runtime["news_task"].cancel()
+    tasks=[x for x in (runtime["task"],runtime["bootstrap_task"],runtime["news_task"],*runtime["backtest_tasks"]) if x]
+    for task in tasks:task.cancel()
+    if tasks:await asyncio.gather(*tasks,return_exceptions=True)
 
 
 app=FastAPI(title="OKX BTC Advisor",version="0.1.0",lifespan=lifespan)
@@ -192,7 +217,11 @@ def settings_put(value:Settings):db.put_settings(value);return value
 
 
 @app.delete("/api/local-data")
-def clear_data():db.clear_local_data();return {"cleared":True}
+def clear_data():
+    db.clear_local_data()
+    runtime["price"],runtime["ticker_ts"]=None,None
+    runtime["news"],runtime["news_source_status"]=_empty_news("本地数据已清除，等待重新同步"),[]
+    return {"cleared":True}
 
 
 async def execute_backtest(job_id:str,req:BacktestRequest):
@@ -218,12 +247,28 @@ async def execute_backtest(job_id:str,req:BacktestRequest):
         db.save_backtest(job_id,"running",.82,"正在运行保守回测")
         result=await asyncio.to_thread(run_backtest,c1,c4,sorted(dict(funding).items()),req.strategy,req.fee_bps,req.slippage_bps)
         db.save_backtest(job_id,"complete",1,"回测完成",result)
+    except asyncio.CancelledError:
+        db.save_backtest(job_id,"failed",1,"服务关闭，回测已取消")
+        raise
     except Exception as e:db.save_backtest(job_id,"failed",1,f"{type(e).__name__}: {e}")
+    finally:
+        if backtest_lock.locked():backtest_lock.release()
 
 
 @app.post("/api/backtests",response_model=BacktestStatus,response_model_by_alias=True,status_code=202)
-async def backtests(req:BacktestRequest,background:BackgroundTasks):
-    id=str(uuid.uuid4());db.save_backtest(id,"queued",0,"等待执行");background.add_task(execute_backtest,id,req);return BacktestStatus(id=id,status="queued",message="等待执行")
+async def backtests(req:BacktestRequest):
+    if backtest_lock.locked():
+        raise HTTPException(409,"已有回测正在运行，请等待其完成")
+    await backtest_lock.acquire()
+    try:
+        id=str(uuid.uuid4());db.save_backtest(id,"queued",0,"等待执行")
+        task=asyncio.create_task(execute_backtest(id,req),name=f"backtest-{id}")
+    except Exception:
+        backtest_lock.release()
+        raise
+    runtime["backtest_tasks"].add(task)
+    task.add_done_callback(runtime["backtest_tasks"].discard)
+    return BacktestStatus(id=id,status="queued",message="等待执行")
 
 
 @app.get("/api/backtests/{id}")

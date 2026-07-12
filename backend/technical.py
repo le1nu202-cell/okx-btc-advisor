@@ -111,18 +111,22 @@ def _volume_profile(candles: list[Candle], bins: int = 32, lookback: int = 120) 
             bucket_volume[touched] += max(candle.volume, 0.0) / len(touched)
     centers = (edges[:-1] + edges[1:]) / 2
     poc_index = int(np.argmax(bucket_volume))
-    ranked = np.argsort(bucket_volume)[::-1]
-    selected: list[int] = []
     target = bucket_volume.sum() * 0.70
-    cumulative = 0.0
-    for index in ranked:
-        selected.append(int(index)); cumulative += bucket_volume[index]
-        if cumulative >= target:
-            break
+    # A value area is a contiguous range around the POC.  Selecting the
+    # globally largest buckets can bridge low-volume gaps and substantially
+    # overstate the 70% area.
+    left=right=poc_index;cumulative=float(bucket_volume[poc_index])
+    while cumulative<target and (left>0 or right<bins-1):
+        left_volume=float(bucket_volume[left-1]) if left>0 else -1.0
+        right_volume=float(bucket_volume[right+1]) if right<bins-1 else -1.0
+        if right_volume>left_volume:
+            right+=1;cumulative+=float(bucket_volume[right])
+        else:
+            left-=1;cumulative+=float(bucket_volume[left])
     return {
         "poc": round(float(centers[poc_index]), 8),
-        "vah": round(float(edges[max(selected) + 1]), 8),
-        "val": round(float(edges[min(selected)]), 8),
+        "vah": round(float(edges[right + 1]), 8),
+        "val": round(float(edges[left]), 8),
         "bins": bins,
         "method": "candle_range_uniform",
     }
@@ -150,6 +154,11 @@ def _rating(candles: list[Candle]) -> dict[str, float | str | bool]:
 def analyze_technical(candles_1h: Iterable[Candle], candles_4h: Iterable[Candle]) -> dict:
     """Return a deterministic, JSON-friendly technical confluence snapshot."""
     one_hour, four_hour = _clean(candles_1h), _clean(candles_4h)
+    # All timeframes must represent the same point-in-time snapshot.  A 4H
+    # candle opening at T is only knowable at T+4H.
+    if one_hour:
+        decision_at=one_hour[-1].timestamp+3_600_000
+        four_hour=[c for c in four_hour if c.timestamp+14_400_000<=decision_at]
     warnings: list[str] = []
     if len(one_hour) < 200 or len(four_hour) < 200:
         warnings.append("至少需要200根已收盘的1H和4H K线完成指标预热")
@@ -198,9 +207,9 @@ def analyze_technical(candles_1h: Iterable[Candle], candles_4h: Iterable[Candle]
     momentum_votes = [float(np.clip((rsi_value - 50) / 20, -1, 1)), float(np.clip(((stoch_value or 50) - 50) / 50, -1, 1)), float(np.clip(((wr_value or -50) + 50) / 50, -1, 1))]
     momentum_score = _clip(sum(momentum_votes) / 3 * GROUP_CAPS["momentum"], GROUP_CAPS["momentum"])
 
-    recent_return = c1[-1] / c1[-4] - 1
-    volatility_raw = np.sign(recent_return) * (0.25 if phase == "NORMAL" else 0.75 if phase == "EXPANSION" else 1.0 if phase == "EXTREME" else 0.0)
-    volatility_score = _clip(volatility_raw * GROUP_CAPS["volatility"], GROUP_CAPS["volatility"])
+    # Volatility changes risk and entry quality, not direction.  Keep it in
+    # the risk overlay instead of casting a second momentum vote.
+    volatility_score = 0.0
     scores = {"trend": trend_score, "structure": structure_score, "volume_price": volume_score, "momentum": momentum_score, "volatility": volatility_score}
     total = _clip(sum(scores.values()), 100)
 

@@ -108,3 +108,12 @@ async def test_async_fetch_partial_and_unavailable_degrade_safely():
     assert unavailable["newsScore"] == 0
     assert unavailable["clusters"] == []
     json.dumps(unavailable, allow_nan=False)
+
+
+@pytest.mark.asyncio
+async def test_fetch_exposes_stable_raw_articles_for_storage():
+    feed=rss(("Bitcoin ETF net inflow","https://news.test/a","Sun, 12 Jul 2026 01:00:00 GMT"))
+    async with httpx.AsyncClient(transport=httpx.MockTransport(lambda request:httpx.Response(200,text=feed))) as client:
+        result=await NewsAggregator(client).fetch(NOW)
+    assert result["rawItems"]
+    assert result["rawItems"][0]["url"]=="https://news.test/a"

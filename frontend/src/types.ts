@@ -16,23 +16,32 @@ export interface SignalAdvice {
   invalidation: string; stopLoss: number | null; targets: number[]; riskReward: number[];
   regime: MarketRegime; dataQuality: DataQuality; configVersion: string; createdAt?: number
 }
+export interface RiskEstimate {
+  equity: number | null; riskPercent: number | null; leverage: number | null;
+  entryPrice: number | null; stopLoss: number | null; stopDistance: number | null;
+  referenceNotional: number | null; quantityBtc: number | null; warnings: string[]
+}
+export interface AdviceResponse { advice: SignalAdvice; riskEstimate: RiskEstimate }
 export interface Settings { equity: number | null; riskPercent: number | null; leverage: number | null; notificationsEnabled: boolean; feeBps?: number; slippageBps?: number; customParameters: Record<string, number> }
-export interface BacktestResult { status: string; strategy: string; netReturn: number | null; maxDrawdown: number | null; sharpe: number | null; profitFactor: number | null; winRate: number | null; trades: number | null; validation: string; updatedAt?: number }
+export interface BacktestResult { status: string; strategy: string; netReturn: number | null; maxDrawdown: number | null; sharpe: number | null; sortino: number | null; calmar: number | null; profitFactor: number | null; winRate: number | null; trades: number | null; exposure: number | null; maxConsecutiveLosses: number | null; averageBarsHeld: number | null; benchmarks: Record<string,number>; holdingRule: string; limitations: string[]; validation: string; updatedAt?: number }
 
 export interface TechnicalMetric { label: string; value: string; tone?: 'positive' | 'negative' | 'neutral' }
 export interface TechnicalGroup {
-  key: string; label: string; rating1h: string; rating4h: string; summary: string; metrics: TechnicalMetric[]
+  key: string; label: string; score: number | null; cap: number | null; direction: string; summary: string; metrics: TechnicalMetric[]
 }
 export interface TechnicalSummary {
   asOf: number | null; status: 'fresh' | 'partial' | 'unavailable'; groups: TechnicalGroup[];
-  vwap: number | null; poc: number | null; vah: number | null; val: number | null;
-  supports: number[]; resistances: number[]; momentum: string; volatilityPhase: string; warnings: string[]
+  technicalScore: number | null; vwap: number | null; weeklyVwap: number | null; mfi: number | null;
+  poc: number | null; vah: number | null; val: number | null; supports: number[]; resistances: number[];
+  momentum: string; volatilityPhase: string; atrPercentile: number | null; bollingerWidthPercentile: number | null;
+  positionScale: number | null; riskReasons: string[]; warnings: string[]
 }
 
 export interface NewsItem {
   id: string; title: string; url: string; source: string; publishedAt: number | null; summary: string;
   category: string; importance: number; importanceLabel: string; sentiment: -1 | 0 | 1;
-  sentimentLabel: string; relevance: number; reason: string
+  sentimentLabel: string; relevance: number; reason: string; importanceScore: number | null;
+  effectiveImpact: number | null; sourceCount: number | null; timeDecay: number | null
 }
 export interface NewsAnalysis {
   asOf: number | null; windowHours: number; score: number; articleCount: number;

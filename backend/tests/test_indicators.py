@@ -20,6 +20,13 @@ def test_atr_constant_range():
     assert np.isfinite(got[-1]) and abs(got[-1]-2)<1e-9
 
 
+def test_wilder_talib_valid_start_indices():
+    close=np.arange(100,180,dtype=float);high=close+1;low=close-1
+    aa=atr(high,low,close,14);dd=adx(high,low,close,14)
+    assert np.all(np.isnan(aa[:14])) and aa[14]==2
+    assert np.all(np.isnan(dd[:27])) and dd[27]==100
+
+
 def test_bollinger_and_obv():
     upper,mid,lower=bollinger(np.ones(30)*10)
     assert upper[-1]==mid[-1]==lower[-1]==10

@@ -4,9 +4,11 @@ import asyncio
 import csv
 import io
 import json
+import math
 import time
 import zipfile
 from collections.abc import Awaitable, Callable
+from urllib.parse import urlsplit
 
 import httpx
 import websockets
@@ -18,6 +20,13 @@ class OKXError(RuntimeError): pass
 
 
 class OKXPublicClient:
+    BULK_DOWNLOAD_HOSTS = {"static.okx.com"}
+    MAX_BULK_URLS = 64
+    MAX_DOWNLOAD_BYTES = 25 * 1024 * 1024
+    MAX_ZIP_ENTRIES = 32
+    MAX_UNCOMPRESSED_BYTES = 100 * 1024 * 1024
+    MAX_COMPRESSION_RATIO = 200
+
     def __init__(self, base_url="https://www.okx.com", ws_url="wss://ws.okx.com:8443/ws/v5/public", timeout=20):
         self.base_url=base_url.rstrip("/"); self.ws_url=ws_url; self.timeout=timeout
 
@@ -36,10 +45,24 @@ class OKXPublicClient:
 
     @staticmethod
     def parse_candles(rows,timeframe):
+        if timeframe not in {"1H","4H"}:
+            raise ValueError(f"unsupported candle timeframe: {timeframe}")
         found={}
+        now_ms=int(time.time()*1000)
         for r in rows:
             if len(r)<9:continue
-            c=Candle(timestamp=int(r[0]),open=float(r[1]),high=float(r[2]),low=float(r[3]),close=float(r[4]),volume=float(r[5]),volume_ccy=float(r[6]) if r[6] else None,confirm=str(r[8])=="1",timeframe=timeframe)
+            try:
+                ts=int(r[0]); values=[float(r[i]) for i in range(1,6)]
+                volume_ccy=float(r[6]) if r[6] else None
+            except (TypeError,ValueError,OverflowError):
+                continue
+            o,h,l,c_value,volume=values
+            finite=all(math.isfinite(x) for x in values) and (volume_ccy is None or math.isfinite(volume_ccy))
+            valid_time=1_230_768_000_000 <= ts <= now_ms+24*3600_000
+            valid_prices=min(o,c_value)>=l>0 and max(o,c_value)<=h and h>0
+            if not finite or not valid_time or not valid_prices or volume<0 or (volume_ccy is not None and volume_ccy<0):
+                continue
+            c=Candle(timestamp=ts,open=o,high=h,low=l,close=c_value,volume=volume,volume_ccy=volume_ccy,confirm=str(r[8])=="1",timeframe=timeframe)
             found[c.timestamp]=c
         return [found[k] for k in sorted(found)]
 
@@ -87,13 +110,39 @@ class OKXPublicClient:
                     else:collect(v)
             elif isinstance(x,list):
                 for y in x:collect(y)
-        collect(items); out={}
+        collect(items); urls=list(dict.fromkeys(urls))
+        if len(urls)>self.MAX_BULK_URLS:
+            raise OKXError("too many bulk funding files")
+        out={}
         async with httpx.AsyncClient(timeout=60,follow_redirects=True) as client:
-            for url in dict.fromkeys(urls):
-                raw=(await client.get(url)).content
+            for url in urls:
+                parts=urlsplit(url)
+                if parts.scheme!="https" or (parts.hostname or "").lower() not in self.BULK_DOWNLOAD_HOSTS:
+                    raise OKXError("untrusted bulk funding download URL")
+                raw=bytearray()
+                async with client.stream("GET",url) as response:
+                    response.raise_for_status()
+                    final=response.url
+                    if final.scheme!="https" or (final.host or "").lower() not in self.BULK_DOWNLOAD_HOSTS:
+                        raise OKXError("bulk funding redirect left the trusted host")
+                    length=response.headers.get("content-length")
+                    if length and int(length)>self.MAX_DOWNLOAD_BYTES:
+                        raise OKXError("bulk funding download exceeds size limit")
+                    async for chunk in response.aiter_bytes():
+                        raw.extend(chunk)
+                        if len(raw)>self.MAX_DOWNLOAD_BYTES:
+                            raise OKXError("bulk funding download exceeds size limit")
                 try:
                     with zipfile.ZipFile(io.BytesIO(raw)) as z:
-                        payload=b"\n".join(z.read(n) for n in z.namelist() if n.lower().endswith(".csv"))
+                        members=[x for x in z.infolist() if x.filename.lower().endswith(".csv") and not x.is_dir()]
+                        if len(members)>self.MAX_ZIP_ENTRIES:
+                            raise OKXError("bulk funding ZIP has too many entries")
+                        total=sum(x.file_size for x in members)
+                        if total>self.MAX_UNCOMPRESSED_BYTES:
+                            raise OKXError("bulk funding ZIP expands beyond size limit")
+                        if any(x.file_size/max(1,x.compress_size)>self.MAX_COMPRESSION_RATIO for x in members):
+                            raise OKXError("bulk funding ZIP compression ratio is unsafe")
+                        payload=b"\n".join(z.read(x) for x in members)
                 except zipfile.BadZipFile: payload=raw
                 text=payload.decode("utf-8-sig",errors="replace")
                 for row in csv.DictReader(io.StringIO(text)):
@@ -113,8 +162,17 @@ class OKXPublicClient:
                     args=[{"channel":"tickers","instId":"BTC-USDT-SWAP"},{"channel":"candle1H","instId":"BTC-USDT-SWAP"},{"channel":"candle4H","instId":"BTC-USDT-SWAP"},{"channel":"funding-rate","instId":"BTC-USDT-SWAP"},{"channel":"open-interest","instId":"BTC-USDT-SWAP"}]
                     await ws.send(json.dumps({"op":"subscribe","args":args})); delay=1
                     async for raw in ws:
-                        msg=json.loads(raw)
-                        if "data" in msg:await on_message(msg)
+                        try:
+                            msg=json.loads(raw)
+                            if not isinstance(msg,dict):continue
+                            if "data" in msg:await on_message(msg)
+                        except Exception as exc:
+                            # A malformed frame or one failed handler invocation must not kill
+                            # the sole long-lived market stream.
+                            try:await on_message({"event":"message_error","error":type(exc).__name__})
+                            except Exception:pass
                         if stop.is_set():break
-            except (OSError,websockets.WebSocketException,asyncio.TimeoutError):
+            except Exception as exc:
+                try:await on_message({"event":"reconnecting","error":type(exc).__name__})
+                except Exception:pass
                 await asyncio.sleep(delay); delay=min(60,delay*2)

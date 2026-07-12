@@ -53,3 +53,39 @@ def test_news_cannot_create_signal_without_technical_setup():
     c1=candles(219);c4=candles(199,"4H")
     a=analyze(c1,c4,now_ms=c1[-1].timestamp+3600_000,news_analysis={"status":"fresh","score":15,"items":[]})
     assert a.action==AdviceAction.WAIT and a.news_score==0
+
+
+def test_invalid_candle_blocks_signal():
+    c1=candles(250,start=1_600_000_000_000+900*3600_000);c4=candles(250,"4H")
+    c1[-1]=c1[-1].model_copy(update={"high":90.0})
+    a=analyze(c1,c4,now_ms=c1[-1].timestamp+3600_000)
+    assert a.action==AdviceAction.WAIT and a.strategy=="invalid_data" and a.confidence==0
+    assert any("非法OHLC" in x for x in a.data_quality.warnings)
+
+
+def test_negative_volume_and_nan_block_signal():
+    for update in ({"volume":-1.0},{"close":float("nan")}):
+        c1=candles(250,start=1_600_000_000_000+900*3600_000);c4=candles(250,"4H")
+        c1[-1]=c1[-1].model_copy(update=update)
+        assert analyze(c1,c4,now_ms=c1[-1].timestamp+3600_000).action==AdviceAction.WAIT
+
+
+def test_invalid_future_4h_does_not_block_current_decision():
+    c1=candles(250,start=1_600_000_000_000+900*3600_000);c4=candles(250,"4H")
+    clean=analyze(c1,c4,now_ms=c1[-1].timestamp+3600_000)
+    future=c4[-1].model_copy(update={"timestamp":c1[-1].timestamp+3600_000,"high":1.0})
+    dirty=analyze(c1,[*c4,future],now_ms=c1[-1].timestamp+3600_000)
+    assert dirty.action==clean.action and dirty.technical_score==clean.technical_score
+
+
+def test_contributions_equal_published_technical_score():
+    c1=candles(250,start=1_600_000_000_000+900*3600_000);c4=candles(250,"4H")
+    a=analyze(c1,c4,now_ms=c1[-1].timestamp+3600_000)
+    assert sum(x.score for x in a.contributions)==a.technical_score
+
+
+def test_wait_confidence_stays_low(monkeypatch):
+    monkeypatch.setattr("backend.strategy.classify_regime",lambda _: (MarketRegime.RANGE,{"adx":10}))
+    c1=candles(250,start=1_600_000_000_000+900*3600_000);c4=candles(250,"4H")
+    a=analyze(c1,c4,now_ms=c1[-1].timestamp+3600_000)
+    assert a.action==AdviceAction.WAIT and a.confidence<=25

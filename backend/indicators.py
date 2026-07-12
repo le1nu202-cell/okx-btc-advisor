@@ -27,9 +27,20 @@ def true_range(high,low,close)->np.ndarray:
 
 def wilder(values,period:int)->np.ndarray:
     x=_a(values); out=np.full(len(x),np.nan)
-    if len(x)<period:return out
-    out[period-1]=np.nanmean(x[:period])
-    for i in range(period,len(x)): out[i]=(out[i-1]*(period-1)+x[i])/period
+    if period<=0:raise ValueError("period must be positive")
+    # Wilder indicators seed from the first *consecutive* period values.  In
+    # particular TR/DM have an undefined first element, so using nanmean on
+    # x[:period] would start ATR one bar early and ADX many bars early.
+    seed_end=None
+    for i in range(period-1,len(x)):
+        window=x[i-period+1:i+1]
+        if np.all(np.isfinite(window)):
+            seed_end=i;break
+    if seed_end is None:return out
+    out[seed_end]=np.mean(x[seed_end-period+1:seed_end+1])
+    for i in range(seed_end+1,len(x)):
+        if not np.isfinite(x[i]):break
+        out[i]=(out[i-1]*(period-1)+x[i])/period
     return out
 
 

@@ -2,12 +2,14 @@ import json
 from datetime import datetime, timezone
 
 from backend.models import Candle
-from backend.technical import GROUP_CAPS, analyze_technical
+from backend.technical import GROUP_CAPS, _volume_profile, analyze_technical
 
 
 def candles(n=260, tf="1H", trend=1.0, start=None, volume=100.0):
     step = 3_600_000 if tf == "1H" else 14_400_000
-    start = start or int(datetime(2026, 1, 1, tzinfo=timezone.utc).timestamp() * 1000)
+    if start is None:
+        start=int(datetime(2026, 1, 1, tzinfo=timezone.utc).timestamp()*1000)
+        if tf=="4H":start-=3*n*3_600_000
     return [Candle(timestamp=start+i*step, open=100+i*trend, high=101+i*trend, low=99+i*trend,
                    close=100.5+i*trend, volume=volume+i%11, timeframe=tf, confirm=True) for i in range(n)]
 
@@ -61,9 +63,33 @@ def test_unconfirmed_duplicate_and_out_of_order_are_cleaned():
 def test_anchor_vwap_uses_current_utc_day_and_week():
     start = int(datetime(2026, 1, 1, tzinfo=timezone.utc).timestamp() * 1000)
     one = candles(260, start=start)
-    result = analyze_technical(one, candles(260, tf="4H", start=start))
+    result = analyze_technical(one, candles(260, tf="4H", start=start-3*260*3_600_000))
     last_day = datetime.fromtimestamp(one[-1].timestamp / 1000, timezone.utc).date()
     current_day = [c for c in one if datetime.fromtimestamp(c.timestamp / 1000, timezone.utc).date() == last_day]
     expected = sum(((c.high+c.low+c.close)/3)*c.volume for c in current_day) / sum(c.volume for c in current_day)
     assert abs(result["volume_price"]["daily_vwap"] - expected) < 1e-7
     assert result["volume_price"]["weekly_vwap"] <= result["volume_price"]["daily_vwap"]
+
+
+def test_future_4h_candle_is_excluded_from_common_decision_time():
+    one,four=candles(),candles(tf="4H")
+    clean=analyze_technical(one,four)
+    decision_at=one[-1].timestamp+3_600_000
+    future=four[-1].model_copy(update={"timestamp":decision_at,"open":1,"low":1,"high":1_000_000,"close":999_999})
+    dirty=analyze_technical(one,[*four,future])
+    assert dirty["technical_score"]==clean["technical_score"]
+    assert dirty["rating_4h"]==clean["rating_4h"]
+
+
+def test_volatility_phase_does_not_cast_directional_vote():
+    result=analyze_technical(candles(),candles(tf="4H"))
+    assert result["group_scores"]["volatility"]==0
+
+
+def test_volume_profile_value_area_expands_contiguously_from_poc():
+    base=int(datetime(2026,1,1,tzinfo=timezone.utc).timestamp()*1000)
+    def at(i,price,volume):
+        return Candle(timestamp=base+i*3_600_000,open=price,high=price+.01,low=price-.01,close=price,volume=volume,timeframe="1H",confirm=True)
+    profile=_volume_profile([at(0,1,100),at(1,2,20),at(2,10,30)],bins=32)
+    assert profile["poc"]<2
+    assert profile["vah"]<3
