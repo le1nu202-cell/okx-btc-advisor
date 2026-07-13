@@ -23,7 +23,12 @@ export interface RiskEstimate {
 }
 export interface AdviceResponse { advice: SignalAdvice; riskEstimate: RiskEstimate }
 export interface Settings { equity: number | null; riskPercent: number | null; leverage: number | null; notificationsEnabled: boolean; feeBps?: number; slippageBps?: number; customParameters: Record<string, number> }
-export interface BacktestResult { status: string; strategy: string; netReturn: number | null; maxDrawdown: number | null; sharpe: number | null; sortino: number | null; calmar: number | null; profitFactor: number | null; winRate: number | null; trades: number | null; exposure: number | null; maxConsecutiveLosses: number | null; averageBarsHeld: number | null; benchmarks: Record<string,number>; holdingRule: string; limitations: string[]; validation: string; updatedAt?: number }
+export interface BacktestParameters { strategy: 'trend'|'range'|'combined'; years: number; feeBps: number; slippageBps: number }
+export interface BacktestSeriesPoint { timestamp: number; value: number }
+export interface BacktestBreakdownRow { label: string; trades: number | null; netReturn: number | null; maxDrawdown: number | null; sharpe: number | null; winRate: number | null; passed?: boolean | null }
+export interface BacktestHistoryCoverage { requestedStart:number|null; requestedEnd:number|null; actualStart1H:number|null; actualEnd1H:number|null; actualStart4H:number|null; actualEnd4H:number|null; rows1H:number|null; rows4H:number|null; durationCoverage:number|null; complete:boolean }
+export interface BacktestResult { status: string; reason?: string; strategy: string; netReturn: number | null; maxDrawdown: number | null; sharpe: number | null; sortino: number | null; calmar: number | null; profitFactor: number | null; winRate: number | null; trades: number | null; exposure: number | null; maxConsecutiveLosses: number | null; averageBarsHeld: number | null; benchmarks: Record<string,number|null>; holdingRule: string; limitations: string[]; validation: string; historyCoverage?:BacktestHistoryCoverage; equityCurve?: BacktestSeriesPoint[]; drawdownCurve?: BacktestSeriesPoint[]; rollingWindows?: BacktestBreakdownRow[]; byYear?: BacktestBreakdownRow[]; byRegime?: BacktestBreakdownRow[]; aggregateOos?: BacktestBreakdownRow & { profitableWindowRatio:number|null; windows:number|null }; lockedHoldout?: BacktestBreakdownRow & { start:number|null; end:number|null }; thresholdPass?: boolean|null; diagnosticsComplete?: boolean|null; validationCriteria?: Record<string,boolean>; stress?: Record<string,{netReturn:number|null;maxDrawdown:number|null;profitFactor:number|null}>; updatedAt?: number }
+export interface BacktestJob { id: string; status: string; progress: number; message: string; result: BacktestResult | null; parameters?: BacktestParameters|null; createdAt?: number|null; updatedAt?: number|null; startedAt?: number|null; finishedAt?: number|null }
 
 export interface TechnicalMetric { label: string; value: string; tone?: 'positive' | 'negative' | 'neutral' }
 export interface TechnicalGroup {
@@ -38,13 +43,16 @@ export interface TechnicalSummary {
 }
 
 export interface NewsItem {
-  id: string; title: string; url: string; source: string; publishedAt: number | null; summary: string;
+  id: string; title: string; url: string; source: string; sources: string[]; publishedAt: number | null; latestPublishedAt: number | null; summary: string;
   category: string; importance: number; importanceLabel: string; sentiment: -1 | 0 | 1;
-  sentimentLabel: string; relevance: number; reason: string; importanceScore: number | null;
-  effectiveImpact: number | null; sourceCount: number | null; timeDecay: number | null
+  sentimentLabel: string; directionConfidence: number | null; relevance: number; reason: string; importanceScore: number | null;
+  effectiveImpact: number | null; sourceCount: number | null; ageHours: number | null; halfLifeHours: number | null;
+  timeDecay: number | null; weightBreakdown: Record<string,number>; weightFormula: string
 }
+export interface NewsSourceStatus { source: string; ok: boolean; itemCount: number; observedAt: number | null; error: string | null }
 export interface NewsAnalysis {
   asOf: number | null; windowHours: number; score: number; articleCount: number;
-  status: 'fresh' | 'partial' | 'unavailable'; warnings: string[]
+  status: 'fresh' | 'partial' | 'unavailable'; sourceCoverage: number; sourceStatus: NewsSourceStatus[];
+  rawImpact: number | null; coverageAdjustedImpact: number | null; reason: string; warnings: string[]
 }
 export interface NewsResponse { items: NewsItem[]; analysis: NewsAnalysis }

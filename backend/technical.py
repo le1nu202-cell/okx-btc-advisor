@@ -163,7 +163,8 @@ def analyze_technical(candles_1h: Iterable[Candle], candles_4h: Iterable[Candle]
     if len(one_hour) < 200 or len(four_hour) < 200:
         warnings.append("至少需要200根已收盘的1H和4H K线完成指标预热")
         return {
-            "ready": False, "group_scores": {name: 0.0 for name in GROUP_CAPS}, "group_caps": GROUP_CAPS,
+            "ready": False, "as_of": one_hour[-1].timestamp if one_hour else None, "four_hour_as_of": four_hour[-1].timestamp if four_hour else None,
+            "group_scores": {name: 0.0 for name in GROUP_CAPS}, "group_caps": GROUP_CAPS,
             "technical_score": 0.0, "rating_1h": _rating(one_hour), "rating_4h": _rating(four_hour),
             "levels": {"donchian_support": None, "donchian_resistance": None, "volume_profile": _volume_profile(one_hour)},
             "volume_price": {"daily_vwap": _anchored_vwap(one_hour, "day"), "weekly_vwap": _anchored_vwap(one_hour, "week"), "mfi": None},
@@ -230,7 +231,7 @@ def analyze_technical(candles_1h: Iterable[Candle], candles_4h: Iterable[Candle]
         position_scale = min(position_scale, 0.75); risk_reasons.append("存在技术面冲突")
 
     return {
-        "ready": True, "as_of": one_hour[-1].timestamp, "group_scores": scores, "group_caps": GROUP_CAPS,
+        "ready": True, "as_of": one_hour[-1].timestamp, "four_hour_as_of": four_hour[-1].timestamp, "group_scores": scores, "group_caps": GROUP_CAPS,
         "technical_score": total, "rating_1h": rating_1h, "rating_4h": rating_4h,
         "levels": {"donchian_support": round(support, 8), "donchian_resistance": round(resistance, 8), "volume_profile": _volume_profile(one_hour)},
         "volume_price": {"daily_vwap": daily_vwap, "weekly_vwap": weekly_vwap, "vwma20": round(vwma20, 8), "mfi": mfi_value},

@@ -20,6 +20,7 @@ class OKXError(RuntimeError): pass
 
 
 class OKXPublicClient:
+    MIN_MARKET_TS = 1_230_768_000_000
     BULK_DOWNLOAD_HOSTS = {"static.okx.com"}
     MAX_BULK_URLS = 64
     MAX_DOWNLOAD_BYTES = 25 * 1024 * 1024
@@ -27,8 +28,8 @@ class OKXPublicClient:
     MAX_UNCOMPRESSED_BYTES = 100 * 1024 * 1024
     MAX_COMPRESSION_RATIO = 200
 
-    def __init__(self, base_url="https://www.okx.com", ws_url="wss://ws.okx.com:8443/ws/v5/public", timeout=20):
-        self.base_url=base_url.rstrip("/"); self.ws_url=ws_url; self.timeout=timeout
+    def __init__(self, base_url="https://www.okx.com", ws_url="wss://ws.okx.com:8443/ws/v5/public", business_ws_url="wss://ws.okx.com:8443/ws/v5/business", timeout=20):
+        self.base_url=base_url.rstrip("/"); self.ws_url=ws_url; self.business_ws_url=business_ws_url; self.timeout=timeout
 
     async def _get(self,path,params=None):
         last=None
@@ -43,12 +44,13 @@ class OKXPublicClient:
                     if attempt<2:await asyncio.sleep(.5*(2**attempt))
         raise OKXError(str(last))
 
-    @staticmethod
-    def parse_candles(rows,timeframe):
+    @classmethod
+    def parse_candles(cls,rows,timeframe,now_ms=None):
         if timeframe not in {"1H","4H"}:
             raise ValueError(f"unsupported candle timeframe: {timeframe}")
         found={}
-        now_ms=int(time.time()*1000)
+        now_ms=int(time.time()*1000) if now_ms is None else int(now_ms)
+        duration_ms=3600_000 if timeframe=="1H" else 4*3600_000
         for r in rows:
             if len(r)<9:continue
             try:
@@ -57,14 +59,64 @@ class OKXPublicClient:
             except (TypeError,ValueError,OverflowError):
                 continue
             o,h,l,c_value,volume=values
+            confirmed=str(r[8])=="1"
             finite=all(math.isfinite(x) for x in values) and (volume_ccy is None or math.isfinite(volume_ccy))
-            valid_time=1_230_768_000_000 <= ts <= now_ms+24*3600_000
+            # An unclosed candle may be charted, but a confirmed candle whose
+            # close is still in the future must never enter advice/backtests.
+            valid_time=(
+                cls.MIN_MARKET_TS<=ts<=now_ms+60_000
+                and (not confirmed or ts+duration_ms<=now_ms+60_000)
+            )
             valid_prices=min(o,c_value)>=l>0 and max(o,c_value)<=h and h>0
             if not finite or not valid_time or not valid_prices or volume<0 or (volume_ccy is not None and volume_ccy<0):
                 continue
-            c=Candle(timestamp=ts,open=o,high=h,low=l,close=c_value,volume=volume,volume_ccy=volume_ccy,confirm=str(r[8])=="1",timeframe=timeframe)
-            found[c.timestamp]=c
+            c=Candle(timestamp=ts,open=o,high=h,low=l,close=c_value,volume=volume,volume_ccy=volume_ccy,confirm=confirmed,timeframe=timeframe)
+            previous=found.get(c.timestamp)
+            if previous is None:
+                found[c.timestamp]=c
+                continue
+            # Confirmation is an irreversible quality upgrade. At the same
+            # quality level cumulative range/volume must not move backwards;
+            # this prevents delayed, poorer data from replacing a richer row.
+            if c.confirm != previous.confirm:
+                if c.confirm:
+                    found[c.timestamp]=c
+                continue
+            loses_currency_volume=previous.volume_ccy is not None and c.volume_ccy is None
+            regresses_cumulative_data=(
+                c.volume < previous.volume or c.high < previous.high or c.low > previous.low
+                or (previous.volume_ccy is not None and c.volume_ccy is not None
+                    and c.volume_ccy < previous.volume_ccy)
+            )
+            if not loses_currency_volume and not regresses_cumulative_data:
+                found[c.timestamp]=c
         return [found[k] for k in sorted(found)]
+
+    @classmethod
+    def parse_ticker(cls,row,now_ms=None):
+        now_ms=int(time.time()*1000) if now_ms is None else int(now_ms)
+        try:price=float(row["last"]);ts=int(row["ts"])
+        except (KeyError,TypeError,ValueError,OverflowError):return None
+        if not math.isfinite(price) or price<=0 or not cls.MIN_MARKET_TS<=ts<=now_ms+60_000:return None
+        return price,ts
+
+    @classmethod
+    def parse_funding_rows(cls,rows,now_ms=None,max_future_ms=24*3600_000):
+        now_ms=int(time.time()*1000) if now_ms is None else int(now_ms);result={}
+        for row in rows:
+            try:ts=int(row["fundingTime"]);rate=float(row["fundingRate"])
+            except (KeyError,TypeError,ValueError,OverflowError):continue
+            if cls.MIN_MARKET_TS<=ts<=now_ms+max_future_ms and math.isfinite(rate) and abs(rate)<=1:
+                result[ts]=rate
+        return sorted(result.items())
+
+    @classmethod
+    def parse_open_interest(cls,row,now_ms=None):
+        now_ms=int(time.time()*1000) if now_ms is None else int(now_ms)
+        try:ts=int(row["ts"]);value=float(row.get("oiCcy") or row["oi"])
+        except (KeyError,TypeError,ValueError,OverflowError):return None
+        if not cls.MIN_MARKET_TS<=ts<=now_ms+60_000 or not math.isfinite(value) or value<0:return None
+        return ts,value
 
     async def candles(self,instrument="BTC-USDT-SWAP",bar="1H",limit=300,after=None,before=None,history=True):
         p={"instId":instrument,"bar":bar,"limit":min(300,limit)}
@@ -88,16 +140,30 @@ class OKXPublicClient:
         return [all_rows[k] for k in sorted(all_rows) if k>=since_ms]
 
     async def ticker(self,instrument="BTC-USDT-SWAP"):
-        d=await self._get("/api/v5/market/ticker",{"instId":instrument}); return d[0] if d else None
+        d=await self._get("/api/v5/market/ticker",{"instId":instrument}); return self.parse_ticker(d[0]) if d else None
 
     async def funding_history(self,instrument="BTC-USDT-SWAP",limit=100,after=None):
         p={"instId":instrument,"limit":min(100,limit)}
         if after:p["after"]=str(after)
-        return [(int(x["fundingTime"]),float(x["fundingRate"])) for x in await self._get("/api/v5/public/funding-rate-history",p)]
+        return self.parse_funding_rows(await self._get("/api/v5/public/funding-rate-history",p))
+
+    async def backfill_funding_history(self,instrument="BTC-USDT-SWAP",since_ms=0,max_pages=8):
+        """Page public funding observations far enough back for 90-day percentiles."""
+        found={};after=None
+        for _ in range(max_pages):
+            rows=await self.funding_history(instrument,100,after)
+            if not rows:break
+            for timestamp,rate in rows:found[timestamp]=rate
+            oldest=min(timestamp for timestamp,_ in rows)
+            if oldest<=since_ms:break
+            if after is not None and oldest>=after:break
+            after=oldest
+            await asyncio.sleep(.12)
+        return [(timestamp,found[timestamp]) for timestamp in sorted(found) if timestamp>=since_ms]
 
     async def open_interest(self,instrument="BTC-USDT-SWAP"):
         d=await self._get("/api/v5/public/open-interest",{"instType":"SWAP","instId":instrument})
-        return (int(d[0].get("ts",time.time()*1000)),float(d[0]["oiCcy"] or d[0]["oi"])) if d else None
+        return self.parse_open_interest(d[0]) if d else None
 
     async def bulk_funding_history(self,begin_ms:int,end_ms:int,inst_family="BTC-USDT") -> list[tuple[int,float]]:
         """Download official monthly public-data ZIPs. Missing months remain missing."""
@@ -149,30 +215,65 @@ class OKXPublicClient:
                     try:
                         if row.get("instrument_name","").upper() not in ("BTC-USDT-SWAP",""):continue
                         ts=int(float(row["funding_time"])); ts=ts*1000 if ts<10_000_000_000 else ts
-                        out[ts]=float(row["funding_rate"])
+                        rate=float(row["funding_rate"])
+                        if self.MIN_MARKET_TS<=ts<=int(time.time()*1000)+24*3600_000 and math.isfinite(rate) and abs(rate)<=1:out[ts]=rate
                     except (KeyError,TypeError,ValueError):continue
         return sorted(out.items())
 
-    async def stream(self,on_message:Callable[[dict],Awaitable[None]],stop:asyncio.Event):
+    async def _stream_endpoint(self,url:str,args:list[dict],stream_name:str,on_message:Callable[[dict],Awaitable[None]],stop:asyncio.Event):
         delay=1
         while not stop.is_set():
             try:
-                async with websockets.connect(self.ws_url,ping_interval=20,ping_timeout=15) as ws:
-                    await on_message({"event":"reconnected"})
-                    args=[{"channel":"tickers","instId":"BTC-USDT-SWAP"},{"channel":"candle1H","instId":"BTC-USDT-SWAP"},{"channel":"candle4H","instId":"BTC-USDT-SWAP"},{"channel":"funding-rate","instId":"BTC-USDT-SWAP"},{"channel":"open-interest","instId":"BTC-USDT-SWAP"}]
-                    await ws.send(json.dumps({"op":"subscribe","args":args})); delay=1
+                async with websockets.connect(url,ping_interval=20,ping_timeout=15) as ws:
+                    await ws.send(json.dumps({"op":"subscribe","args":args}))
+                    healthy=False
                     async for raw in ws:
                         try:
                             msg=json.loads(raw)
                             if not isinstance(msg,dict):continue
-                            if "data" in msg:await on_message(msg)
+                            if msg.get("event")=="error":
+                                raise OKXError(msg.get("msg") or "OKX rejected the public subscription")
+                            if "data" in msg and self._valid_stream_message(msg):
+                                # A TCP handshake alone is not a healthy market stream. Reset
+                                # backoff and announce recovery only after OKX sends real data.
+                                if not healthy:
+                                    healthy=True;delay=1
+                                    await on_message({"event":"reconnected","stream":stream_name})
+                                await on_message({**msg,"_stream":stream_name})
+                            elif "data" in msg:
+                                await on_message({"event":"message_error","stream":stream_name,"error":"InvalidMarketData"})
+                        except OKXError:
+                            raise
                         except Exception as exc:
                             # A malformed frame or one failed handler invocation must not kill
                             # the sole long-lived market stream.
                             try:await on_message({"event":"message_error","error":type(exc).__name__})
                             except Exception:pass
                         if stop.is_set():break
+                    if not stop.is_set():
+                        raise OKXError("public market stream closed")
             except Exception as exc:
-                try:await on_message({"event":"reconnecting","error":type(exc).__name__})
+                try:await on_message({"event":"reconnecting","stream":stream_name,"error":type(exc).__name__})
                 except Exception:pass
-                await asyncio.sleep(delay); delay=min(60,delay*2)
+                if not stop.is_set():
+                    await asyncio.sleep(delay); delay=min(60,delay*2)
+
+    def _valid_stream_message(self,msg:dict)->bool:
+        data=msg.get("data")
+        if not isinstance(data,list) or not data:return False
+        channel=str(msg.get("arg",{}).get("channel",''))
+        try:
+            if channel=="tickers":return self.parse_ticker(data[0]) is not None
+            if channel=="funding-rate":return bool(self.parse_funding_rows(data,max_future_ms=48*3600_000))
+            if channel=="open-interest":return self.parse_open_interest(data[0]) is not None
+            if channel in {"candle1H","candle4H"}:return bool(self.parse_candles(data,"1H" if channel=="candle1H" else "4H"))
+        except (TypeError,ValueError,IndexError):return False
+        return False
+
+    async def stream(self,on_message:Callable[[dict],Awaitable[None]],stop:asyncio.Event):
+        public_args=[{"channel":"tickers","instId":"BTC-USDT-SWAP"},{"channel":"funding-rate","instId":"BTC-USDT-SWAP"},{"channel":"open-interest","instId":"BTC-USDT-SWAP"}]
+        candle_args=[{"channel":"candle1H","instId":"BTC-USDT-SWAP"},{"channel":"candle4H","instId":"BTC-USDT-SWAP"}]
+        await asyncio.gather(
+            self._stream_endpoint(self.ws_url,public_args,"public",on_message,stop),
+            self._stream_endpoint(self.business_ws_url,candle_args,"candles",on_message,stop),
+        )

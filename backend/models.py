@@ -12,7 +12,11 @@ def utc_now_iso() -> str:
 
 
 class APIModel(BaseModel):
-    model_config = ConfigDict(alias_generator=lambda s: s.split("_")[0] + "".join(p.title() for p in s.split("_")[1:]), populate_by_name=True)
+    model_config = ConfigDict(
+        alias_generator=lambda s: s.split("_")[0] + "".join(p.title() for p in s.split("_")[1:]),
+        populate_by_name=True,
+        allow_inf_nan=False,
+    )
 
 
 class MarketRegime(str, Enum):
@@ -76,7 +80,7 @@ class SignalAdvice(APIModel):
     risk_reward: list[float] = Field(default_factory=list)
     explanation: str
     data_quality: DataQuality
-    config_version: str = "validated-v1"
+    config_version: str = "research-v2-unvalidated"
     created_at: str = Field(default_factory=utc_now_iso)
 
 
@@ -106,6 +110,8 @@ class Settings(APIModel):
     def finite_values(cls, value: dict[str, float]) -> dict[str, float]:
         if len(value) > 30 or any(not (-1e6 < float(v) < 1e6) for v in value.values()):
             raise ValueError("自定义参数无效")
+        if value:
+            raise ValueError("当前版本尚未将自定义策略参数接入计算，因此不接受非空自定义参数")
         return value
 
 
