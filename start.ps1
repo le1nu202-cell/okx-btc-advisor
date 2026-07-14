@@ -11,7 +11,7 @@ Set-Location $ProjectRoot
 $url = "http://127.0.0.1:$Port"
 $expectedAppId = 'okx-btc-advisor'
 $expectedInstrument = 'BTC-USDT-SWAP'
-$expectedVersion = '0.4.0'
+$expectedVersion = '0.5.0'
 
 function Test-LocalPortInUse {
     param([int]$TargetPort)

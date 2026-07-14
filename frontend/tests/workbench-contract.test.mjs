@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import { DEFAULT_PLAN } from '../src/workbench-types.ts'
+import { DEFAULT_PLAN, normalizeTradePlanDraft } from '../src/workbench-types.ts'
 import { LEGAL_ACTIONS, prefillForAction, priceOrderError } from '../src/workbench-utils.ts'
 
 test('v0.4 默认参数符合 80U、66x、4%、2 倍和成本约定', () => {
@@ -10,6 +10,13 @@ test('v0.4 默认参数符合 80U、66x、4%、2 倍和成本约定', () => {
   assert.equal(DEFAULT_PLAN.initialMarginPercent, 4)
   assert.equal(DEFAULT_PLAN.addMultiplier, 2)
   assert.deepEqual([DEFAULT_PLAN.makerFeeBps, DEFAULT_PLAN.takerFeeBps, DEFAULT_PLAN.slippageBps], [2, 5, 5])
+})
+
+test('v0.4 旧计划缺全仓可用权益时沿用该计划权益而不是新计划默认 80U', () => {
+  const legacy = { ...DEFAULT_PLAN, equity: 123 }
+  delete legacy.crossAvailableEquity
+  assert.equal(normalizeTradePlanDraft(legacy).crossAvailableEquity, 123)
+  assert.equal(normalizeTradePlanDraft({ ...legacy, crossAvailableEquity: 45 }).crossAvailableEquity, 45)
 })
 
 test('四价顺序对做多和做空分别给出中文错误', () => {

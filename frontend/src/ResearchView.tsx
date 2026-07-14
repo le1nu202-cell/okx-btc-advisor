@@ -8,7 +8,13 @@ import { clearBacktestJobHistory } from './backtest-storage'
 import { adviceIsCurrent, adviceValidationLabel, confidencePercent, notificationKey, uniqueMessages } from './ui-contracts'
 import type { AdviceAction, Candle, MarketRegime, MarketSnapshot, NewsResponse, RiskEstimate, Settings, SignalAdvice, TechnicalSummary } from './types'
 
-const emptySnapshot: MarketSnapshot = { instrument: 'BTC-USDT-SWAP', price: null, updatedAt: null, stale: true, connectionStatus: 'disconnected', fundingRate: null, fundingTime: null, openInterest: null, openInterestTime: null, candles1h: [], candles4h: [] }
+const emptyCandleStatus = {
+  '1m': { available: false, stale: true, lastAt: null, gapDetected: false },
+  '15m': { available: false, stale: true, lastAt: null, gapDetected: false },
+  '1H': { available: false, stale: true, lastAt: null, gapDetected: false },
+  '4H': { available: false, stale: true, lastAt: null, gapDetected: false },
+}
+const emptySnapshot: MarketSnapshot = { instrument: 'BTC-USDT-SWAP', price: null, markPrice: null, markPriceTime: null, updatedAt: null, stale: true, connectionStatus: 'disconnected', fundingRate: null, fundingTime: null, openInterest: null, openInterestTime: null, candles1m: [], candles15m: [], candles1h: [], candles4h: [], candleStatus: emptyCandleStatus }
 const emptySettings: Settings = { equity: null, riskPercent: null, leverage: null, notificationsEnabled: false, customParameters: {} }
 const labels: Record<AdviceAction, string> = { LONG_CANDIDATE: '做多候选', SHORT_CANDIDATE: '做空候选', WATCH_LONG: '偏多观察', WATCH_SHORT: '偏空观察', WAIT: '等待机会' }
 const regimeLabels: Record<MarketRegime, string> = { TREND: '趋势', RANGE: '震荡', TRANSITION: '过渡', STALE: '数据过期' }

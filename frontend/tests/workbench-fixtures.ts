@@ -3,6 +3,7 @@ import type {
   ActualFill,
   ExecutionRisk,
   ExecutionSummary,
+  LiquidationEstimate,
   RiskCalculation,
   TradePlanDraft,
   TradePlanRecord,
@@ -68,6 +69,32 @@ export const plannedRisk: RiskCalculation = {
   assumptions: [],
 }
 
+export const liquidationEstimate: LiquidationEstimate = {
+  status: 'AVAILABLE',
+  estimatedLiquidationPrice: 95_000,
+  referenceMarkPrice: 100_880,
+  referenceMarkTime: 1_800_003_600_000,
+  referenceMarkStatus: 'AVAILABLE',
+  distanceStatus: 'AVAILABLE',
+  distancePercent: 5.83,
+  distanceRisk: '充足',
+  hardStopSequence: 'STOP_FIRST',
+  hardStopBufferPercent: 2.95,
+  quantityBtc: plannedRisk.totalQuantityBtc,
+  averageEntryPrice: plannedRisk.averageEntryPrice,
+  supportingEquityUsdt: 80,
+  maintenanceMarginRate: 0.004,
+  maintenanceMarginFixedUsdt: 0,
+  liquidationFeeRate: 0.001,
+  tier: 1,
+  contracts: 62.94,
+  parameterSource: 'OKX_PUBLIC',
+  parametersUpdatedAt: 1_800_000_000_000,
+  assumptions: ['测试假设'],
+  warnings: [],
+  errors: [],
+}
+
 export const executionRisk: ExecutionRisk = {
   quantityBtc: 0.0059,
   averageEntryPrice: 100_777.123456,
@@ -99,6 +126,16 @@ export const candles1h: Candle[] = [
   { timestamp: 1_800_003_600_000, open: 100_200, high: 101_200, low: 100_100, close: 100_900, volume: 12, confirm: true },
 ]
 
+export const candles1m: Candle[] = [
+  { timestamp: 1_800_003_480_000, open: 100_700, high: 100_850, low: 100_650, close: 100_800, volume: 2, confirm: true },
+  { timestamp: 1_800_003_540_000, open: 100_800, high: 101_000, low: 100_750, close: 100_900, volume: 3, confirm: true },
+]
+
+export const candles15m: Candle[] = [
+  { timestamp: 1_800_001_800_000, open: 100_300, high: 100_800, low: 100_200, close: 100_700, volume: 6, confirm: true },
+  { timestamp: 1_800_002_700_000, open: 100_700, high: 101_000, low: 100_600, close: 100_900, volume: 8, confirm: true },
+]
+
 export const candles4h: Candle[] = [
   { timestamp: 1_799_985_600_000, open: 99_600, high: 100_600, low: 99_400, close: 100_200, volume: 40, confirm: true },
   { timestamp: 1_800_000_000_000, open: 100_200, high: 101_300, low: 100_000, close: 100_900, volume: 48, confirm: true },
@@ -107,6 +144,8 @@ export const candles4h: Candle[] = [
 export const snapshot: MarketSnapshot = {
   instrument: 'BTC-USDT-SWAP',
   price: 100_900,
+  markPrice: 100_880,
+  markPriceTime: Date.now(),
   updatedAt: Date.now(),
   stale: false,
   connectionStatus: 'connected',
@@ -114,8 +153,16 @@ export const snapshot: MarketSnapshot = {
   fundingTime: null,
   openInterest: null,
   openInterestTime: null,
+  candles1m,
+  candles15m,
   candles1h,
   candles4h,
+  candleStatus: {
+    '1m': { available: true, stale: false, lastAt: candles1m.at(-1)!.timestamp, gapDetected: false },
+    '15m': { available: true, stale: false, lastAt: candles15m.at(-1)!.timestamp, gapDetected: false },
+    '1H': { available: true, stale: false, lastAt: candles1h.at(-1)!.timestamp, gapDetected: false },
+    '4H': { available: true, stale: false, lastAt: candles4h.at(-1)!.timestamp, gapDetected: false },
+  },
 }
 
 export const actualFill = (price: number, quantityBtc: number, confirmedAt: number): ActualFill =>

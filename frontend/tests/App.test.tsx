@@ -3,7 +3,11 @@ import { render, screen } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 
 vi.mock('../src/WorkbenchView', () => ({
-  default: () => <main aria-label="工作台内容">工作台交互测试页</main>,
+  default: () => <main aria-label="当前交易内容">当前交易交互测试页</main>,
+}))
+
+vi.mock('../src/TradeHistoryView', () => ({
+  default: () => <main aria-label="历史记录内容">历史记录交互测试页</main>,
 }))
 
 vi.mock('../src/ResearchView', () => ({
@@ -12,17 +16,21 @@ vi.mock('../src/ResearchView', () => ({
 
 import App from '../src/App'
 
-it('默认进入工作台，并可真实点击切换研究区再返回', async () => {
+it('默认进入当前交易，并可真实点击切换历史记录和研究区', async () => {
   const user = userEvent.setup()
   render(<App/>)
 
-  expect(screen.getByRole('main', { name: '工作台内容' })).toBeTruthy()
-  expect(screen.getByRole('tab', { name: '交易工作台' }).getAttribute('aria-selected')).toBe('true')
+  expect(screen.getByRole('main', { name: '当前交易内容' })).toBeTruthy()
+  expect(screen.getByRole('tab', { name: '当前交易' }).getAttribute('aria-selected')).toBe('true')
+
+  await user.click(screen.getByRole('tab', { name: '历史记录' }))
+  expect(screen.getByRole('main', { name: '历史记录内容' })).toBeTruthy()
+  expect(screen.getByRole('tab', { name: '历史记录' }).getAttribute('aria-selected')).toBe('true')
 
   await user.click(screen.getByRole('tab', { name: '研究区' }))
   expect(screen.getByRole('main', { name: '研究区内容' })).toBeTruthy()
   expect(screen.getByText('实验研究区')).toBeTruthy()
 
-  await user.click(screen.getByRole('tab', { name: '交易工作台' }))
-  expect(screen.getByRole('main', { name: '工作台内容' })).toBeTruthy()
+  await user.click(screen.getByRole('button', { name: '返回当前交易' }))
+  expect(screen.getByRole('main', { name: '当前交易内容' })).toBeTruthy()
 })

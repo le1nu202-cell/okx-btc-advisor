@@ -3,10 +3,13 @@ import type { CandlestickData, SeriesMarker, UTCTimestamp } from 'lightweight-ch
 import type { Candle } from './types'
 import type { ActualFill, ActualFillKey, ExecutionRisk, RiskCalculation, TradeDirection, TradePlanDraft } from './workbench-types'
 
-export type ChartTimeframe = '1H' | '4H'
+export const CHART_TIMEFRAMES = ['1m', '15m', '1H', '4H'] as const
+export type ChartTimeframe = typeof CHART_TIMEFRAMES[number]
+export type PriceLineGroup = 'planned' | 'actual'
 
 export interface PlanPriceLineDefinition {
-  id: 'initial-entry' | 'add' | 'stop' | 'take-profit' | 'average-entry' | 'full-cost-breakeven'
+  id: 'planned-initial-entry' | 'planned-add' | 'planned-stop' | 'planned-take-profit' | 'planned-average-entry' | 'planned-full-cost-breakeven' | 'actual-average-entry' | 'actual-full-cost-breakeven'
+  group: PriceLineGroup
   title: string
   price: number
   color: string
@@ -30,13 +33,7 @@ export function toChartCandles(candles: readonly Candle[]): CandlestickData<UTCT
       || candle.low > candle.high
     ) continue
     const time = utcSeconds(candle.timestamp)
-    byTime.set(Number(time), {
-      time,
-      open: candle.open,
-      high: candle.high,
-      low: candle.low,
-      close: candle.close,
-    })
+    byTime.set(Number(time), { time, open: candle.open, high: candle.high, low: candle.low, close: candle.close })
   }
   return [...byTime.values()].sort((left, right) => Number(left.time) - Number(right.time))
 }
@@ -46,19 +43,18 @@ export function buildPlanPriceLines(
   plannedRisk: RiskCalculation | null,
   executionRisk: ExecutionRisk | null,
 ): PlanPriceLineDefinition[] {
-  const actualAverage = executionRisk?.averageEntryPrice
-  const actualBreakeven = executionRisk?.fullCostBreakevenPrice
-  const average = finitePositive(actualAverage) ? actualAverage : plannedRisk?.averageEntryPrice
-  const breakeven = finitePositive(actualBreakeven)
-    ? actualBreakeven
-    : plannedRisk?.fullCostBreakevenPrice ?? plannedRisk?.allInBreakevenPrice ?? plannedRisk?.feeAdjustedBreakevenPrice
+  const plannedBreakeven = plannedRisk?.fullCostBreakevenPrice
+    ?? plannedRisk?.allInBreakevenPrice
+    ?? plannedRisk?.feeAdjustedBreakevenPrice
   const candidates: Array<PlanPriceLineDefinition | null> = [
-    finitePositive(plan.initialEntryPrice) ? { id: 'initial-entry', title: '初始开仓价', price: plan.initialEntryPrice, color: '#49e7ac', lineStyle: LineStyle.Solid } : null,
-    finitePositive(plan.addPrice) ? { id: 'add', title: '第一压力位 / 加仓价', price: plan.addPrice, color: '#f3b64a', lineStyle: LineStyle.Solid } : null,
-    finitePositive(plan.stopPrice) ? { id: 'stop', title: '第二压力位 / 硬止损价', price: plan.stopPrice, color: '#ff627d', lineStyle: LineStyle.Solid } : null,
-    finitePositive(plan.takeProfitPrice) ? { id: 'take-profit', title: '止盈价', price: plan.takeProfitPrice, color: '#56a8ff', lineStyle: LineStyle.Solid } : null,
-    finitePositive(average) ? { id: 'average-entry', title: finitePositive(actualAverage) ? '实际加权均价' : '计划加权均价', price: average, color: '#c38cff', lineStyle: LineStyle.Dashed } : null,
-    finitePositive(breakeven) ? { id: 'full-cost-breakeven', title: finitePositive(actualBreakeven) ? '实际全成本保本价' : '计划全成本保本价', price: breakeven, color: '#f6ef91', lineStyle: LineStyle.Dashed } : null,
+    finitePositive(plan.initialEntryPrice) ? { id: 'planned-initial-entry', group: 'planned', title: '计划 · 初始开仓价', price: plan.initialEntryPrice, color: '#829bb0', lineStyle: LineStyle.Solid } : null,
+    finitePositive(plan.addPrice) ? { id: 'planned-add', group: 'planned', title: '计划 · 加仓价', price: plan.addPrice, color: '#b89a61', lineStyle: LineStyle.Solid } : null,
+    finitePositive(plan.stopPrice) ? { id: 'planned-stop', group: 'planned', title: '计划 · 硬止损价', price: plan.stopPrice, color: '#e0677d', lineStyle: LineStyle.Solid } : null,
+    finitePositive(plan.takeProfitPrice) ? { id: 'planned-take-profit', group: 'planned', title: '计划 · 止盈价', price: plan.takeProfitPrice, color: '#6ea5d8', lineStyle: LineStyle.Solid } : null,
+    finitePositive(plannedRisk?.averageEntryPrice) ? { id: 'planned-average-entry', group: 'planned', title: '计划 · 加权均价', price: plannedRisk.averageEntryPrice, color: '#9aafc1', lineStyle: LineStyle.Solid } : null,
+    finitePositive(plannedBreakeven) ? { id: 'planned-full-cost-breakeven', group: 'planned', title: '计划 · 全成本保本价', price: plannedBreakeven, color: '#a7c2d3', lineStyle: LineStyle.Solid } : null,
+    finitePositive(executionRisk?.averageEntryPrice) ? { id: 'actual-average-entry', group: 'actual', title: '实际 · 加权均价', price: executionRisk.averageEntryPrice, color: '#49e7ac', lineStyle: LineStyle.Dashed } : null,
+    finitePositive(executionRisk?.fullCostBreakevenPrice) ? { id: 'actual-full-cost-breakeven', group: 'actual', title: '实际 · 全成本保本价', price: executionRisk.fullCostBreakevenPrice, color: '#9af0cf', lineStyle: LineStyle.Dotted } : null,
   ]
   return candidates.filter((line): line is PlanPriceLineDefinition => line !== null)
 }

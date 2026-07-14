@@ -98,7 +98,9 @@ def test_okx_parse_rejects_nonfinite_invalid_ohlc_and_time():
         [valid_ts,"1","2",".5","1.5","-1","15","0","1"],
     ]
     assert OKXPublicClient.parse_candles(rows,"1H")==[]
-    with pytest.raises(ValueError):OKXPublicClient.parse_candles([],"1m")
+    assert OKXPublicClient.parse_candles([],"1m")==[]
+    assert OKXPublicClient.parse_candles([],"15m")==[]
+    with pytest.raises(ValueError):OKXPublicClient.parse_candles([],"5m")
 
 
 def test_okx_parse_never_accepts_a_future_confirmed_candle():
@@ -354,7 +356,7 @@ async def test_stream_splits_candles_onto_the_public_business_endpoint(monkeypat
     by_name={name:(url,args) for url,args,name in calls}
     assert by_name["public"][0]==client.ws_url and by_name["candles"][0]==client.business_ws_url
     assert all(not item["channel"].startswith("candle") for item in by_name["public"][1])
-    assert {item["channel"] for item in by_name["candles"][1]}=={"candle1H","candle4H"}
+    assert {item["channel"] for item in by_name["candles"][1]}=={"candle1m","candle15m","candle1H","candle4H"}
 
 
 def test_backtest_insufficient_is_not_validated():

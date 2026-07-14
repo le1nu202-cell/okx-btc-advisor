@@ -2,10 +2,20 @@ export type MarketRegime = 'TREND' | 'RANGE' | 'TRANSITION' | 'STALE'
 export type AdviceAction = 'LONG_CANDIDATE' | 'SHORT_CANDIDATE' | 'WATCH_LONG' | 'WATCH_SHORT' | 'WAIT'
 
 export interface Candle { timestamp: number; open: number; high: number; low: number; close: number; volume: number; confirm?: boolean }
+export type MarketTimeframe = '1m' | '15m' | '1H' | '4H'
+export interface CandleTimeframeStatus {
+  available: boolean
+  stale: boolean
+  lastAt: number | null
+  lastConfirmedAt?: number | null
+  gapDetected: boolean
+}
 export interface MarketSnapshot {
   instrument: string; price: number | null; updatedAt: number | null; stale: boolean; connectionStatus: string;
   fundingRate: number | null; fundingTime: number | null; openInterest: number | null; openInterestTime: number | null;
-  candles1h: Candle[]; candles4h: Candle[]
+  candles1m: Candle[]; candles15m: Candle[]; candles1h: Candle[]; candles4h: Candle[]
+  markPrice: number | null; markPriceTime: number | null
+  candleStatus: Record<MarketTimeframe, CandleTimeframeStatus>
 }
 export interface Contribution { name: string; score: number; value: number | null; explanation: string }
 export interface DataQuality { fresh: boolean; lastCandleAt: number | null; fundingAvailable: boolean; openInterestAvailable: boolean; warnings: string[] }

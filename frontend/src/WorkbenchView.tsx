@@ -1,199 +1,324 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import type { FormEvent } from 'react'
-import { AlertOctagon, AlertTriangle, Calculator, CheckCircle2, LoaderCircle, RefreshCw, Save, ShieldAlert, Wifi, WifiOff } from 'lucide-react'
+import type { FormEvent, ReactNode } from 'react'
+import { AlertTriangle, CheckCircle2, ChevronRight, LoaderCircle, RefreshCw, Save, ShieldAlert, Wifi, WifiOff } from 'lucide-react'
 import TradingPlanChart from './components/TradingPlanChart'
+import type { ChartTimeframe } from './chart-adapter'
+import { normalizeCandle } from './api'
 import { workbenchApi } from './workbench-api'
 import { ACTION_LABELS, STATE_LABELS, canonicalExecutionState, isTerminalState, legalActionsForState, prefillForAction, priceOrderError, toInputNumber } from './workbench-utils'
-import { DEFAULT_PLAN } from './workbench-types'
-import type { ActiveReminder, ExecutionRisk, FillAction, RiskCalculation, TradePlanDraft, TradePlanRecord } from './workbench-types'
-import type { MarketSnapshot } from './types'
+import { DEFAULT_PLAN, normalizeTradePlanDraft } from './workbench-types'
+import type { ExecutionRisk, FillAction, LiquidationEstimate, RiskCalculation, TradePlanDraft, TradePlanRecord } from './workbench-types'
+import type { Candle, MarketSnapshot, MarketTimeframe } from './types'
 
-const EMPTY_SNAPSHOT: MarketSnapshot = { instrument: 'BTC-USDT-SWAP', price: null, updatedAt: null, stale: true, connectionStatus: 'disconnected', fundingRate: null, fundingTime: null, openInterest: null, openInterestTime: null, candles1h: [], candles4h: [] }
+const EMPTY_STATUS = {
+  '1m': { available: false, stale: true, lastAt: null, gapDetected: false },
+  '15m': { available: false, stale: true, lastAt: null, gapDetected: false },
+  '1H': { available: false, stale: true, lastAt: null, gapDetected: false },
+  '4H': { available: false, stale: true, lastAt: null, gapDetected: false },
+}
+const EMPTY_SNAPSHOT: MarketSnapshot = {
+  instrument: 'BTC-USDT-SWAP', price: null, markPrice: null, markPriceTime: null, updatedAt: null,
+  stale: true, connectionStatus: 'disconnected', fundingRate: null, fundingTime: null,
+  openInterest: null, openInterestTime: null, candles1m: [], candles15m: [], candles1h: [], candles4h: [],
+  candleStatus: EMPTY_STATUS,
+}
 const EMPTY_RECORD: TradePlanRecord = { id: null, state: 'IDLE', plan: null, risk: null, actualFills: {}, activeReminder: null }
 
 const money = (value: number | null | undefined, digits = 2) => value == null || !Number.isFinite(value) ? '—' : new Intl.NumberFormat('zh-CN', { minimumFractionDigits: digits, maximumFractionDigits: digits }).format(value)
 const quantity = (value: number | null | undefined) => value == null || !Number.isFinite(value) ? '—' : value.toFixed(8)
 const percent = (value: number | null | undefined) => value == null || !Number.isFinite(value) ? '—' : `${value.toFixed(2)}%`
 const time = (value: number | null | undefined) => value ? new Intl.DateTimeFormat('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false }).format(value) : '—'
-const connectionLabel = (value: string) => value === 'connected' ? '公共行情已连接' : value === 'reconnecting' || value === 'starting' ? '公共行情重连中' : value === 'degraded' ? '公共行情部分可用' : '公共行情未连接'
-const actualRiskLevel = (value: number | null | undefined, plan: TradePlanDraft) => value == null ? '等待计算' : value <= plan.riskLowMaxPercent ? '低' : value <= plan.riskMediumMaxPercent ? '中' : value <= plan.riskHighMaxPercent ? '高' : '极高'
+const connectionLabel = (value: string) => value === 'connected' ? '已连接' : value === 'reconnecting' || value === 'starting' ? '重连中' : value === 'degraded' ? '部分可用' : '未连接'
+const normalizedPlan = normalizeTradePlanDraft
+const liquidationAvailable = (value: LiquidationEstimate | null | undefined): value is LiquidationEstimate & { estimatedLiquidationPrice: number } => value?.status === 'AVAILABLE' && value.estimatedLiquidationPrice != null
+const liquidationDistanceAvailable = (value: LiquidationEstimate | null | undefined): value is LiquidationEstimate & { distancePercent: number } => value?.distanceStatus === 'AVAILABLE' && value.distancePercent != null
+const liquidationPrice = (value: LiquidationEstimate | null | undefined) => liquidationAvailable(value) ? `${money(value.estimatedLiquidationPrice)} USDT` : '不可用'
+const liquidationDanger = (value: LiquidationEstimate | null | undefined) => value?.hardStopSequence === 'LIQUIDATION_FIRST' || value?.hardStopSequence === 'OVERLAP_UNSAFE' || ['危险', '可能早于止损强平'].includes(value?.distanceRisk ?? '')
+const CANDLE_LIMITS: Record<MarketTimeframe, number> = { '1m': 10_080, '15m': 8_640, '1H': 2_000, '4H': 2_000 }
+const isMarketTimeframe = (value: unknown): value is MarketTimeframe => value === '1m' || value === '15m' || value === '1H' || value === '4H'
+export const mergeRealtimeCandles = (existing: Candle[], incoming: Candle[], limit: number) => {
+  const merged = new Map(existing.map(candle => [candle.timestamp, candle]))
+  for (const candle of incoming) merged.set(candle.timestamp, candle)
+  return [...merged.values()].sort((left, right) => left.timestamp - right.timestamp).slice(-limit)
+}
+const withRealtimeCandles = (current: MarketSnapshot, timeframe: MarketTimeframe, incoming: Candle[], gapDetected: boolean): MarketSnapshot => {
+  const currentRows = timeframe === '1m' ? current.candles1m : timeframe === '15m' ? current.candles15m : timeframe === '1H' ? current.candles1h : current.candles4h
+  const rows = mergeRealtimeCandles(currentRows, incoming, CANDLE_LIMITS[timeframe])
+  const latest = rows.at(-1)
+  const latestConfirmed = [...rows].reverse().find(candle => candle.confirm)
+  const candleStatus = { ...current.candleStatus, [timeframe]: { available: rows.length > 0, stale: false, lastAt: latest?.timestamp ?? null, lastConfirmedAt: latestConfirmed?.timestamp ?? null, gapDetected } }
+  if (timeframe === '1m') return { ...current, candles1m: rows, candleStatus }
+  if (timeframe === '15m') return { ...current, candles15m: rows, candleStatus }
+  if (timeframe === '1H') return { ...current, candles1h: rows, candleStatus }
+  return { ...current, candles4h: rows, candleStatus }
+}
 
 function Metric({ label, value, hint, tone }: { label: string; value: string; hint?: string; tone?: string }) {
-  return <div className="wb-metric"><span>{label}</span><strong className={tone}>{value}</strong>{hint && <small>{hint}</small>}</div>
+  return <div className="v05-metric"><span>{label}</span><strong className={tone}>{value}</strong>{hint && <small>{hint}</small>}</div>
 }
 
 function NumberField({ label, value, onChange, step = 'any', min = 0, disabled = false, suffix, required = false }: { label: string; value: number | null; onChange: (value: number | null) => void; step?: string | number; min?: number; disabled?: boolean; suffix?: string; required?: boolean }) {
-  return <label className="wb-field"><span>{label}</span><div><input type="number" min={min} step={step} value={value ?? ''} disabled={disabled} required={required} onChange={event => onChange(toInputNumber(event.target.value))}/>{suffix && <em>{suffix}</em>}</div></label>
+  return <label className="v05-field"><span>{label}</span><div><input type="number" min={min} step={step} value={value ?? ''} disabled={disabled} required={required} onChange={event => onChange(toInputNumber(event.target.value))}/>{suffix && <em>{suffix}</em>}</div></label>
 }
 
-function PlanForm({ draft, setDraft, record, risk, saving, onSave }: { draft: TradePlanDraft; setDraft: (plan: TradePlanDraft) => void; record: TradePlanRecord; risk: RiskCalculation | null; saving: boolean; onSave: (event: FormEvent) => void }) {
-  const executionState = canonicalExecutionState(record.state)
-  const terminal = isTerminalState(executionState)
-  const editable = !record.id || executionState === 'PLANNED' || terminal
+function SwitchField({ label, checked, onChange, disabled = false, hint }: { label: string; checked: boolean; onChange: (value: boolean) => void; disabled?: boolean; hint?: string }) {
+  return <label className="v05-switch-field"><input type="checkbox" checked={checked} disabled={disabled} onChange={event => onChange(event.target.checked)}/><span><strong>{label}</strong>{hint && <small>{hint}</small>}</span></label>
+}
+
+function PanelTitle({ kicker, title, badge }: { kicker: string; title: string; badge?: ReactNode }) {
+  return <div className="v05-panel-title"><div><span>{kicker}</span><h2>{title}</h2></div>{badge}</div>
+}
+
+function PlanSimulationPanel({ draft, setDraft, record, risk, saving, onSave }: { draft: TradePlanDraft; setDraft: (plan: TradePlanDraft) => void; record: TradePlanRecord; risk: RiskCalculation | null; saving: boolean; onSave: (event: FormEvent) => void }) {
+  const state = canonicalExecutionState(record.state)
+  const editable = !record.id || state === 'PLANNED' || isTerminalState(state)
   const orderError = priceOrderError(draft)
   const set = <K extends keyof TradePlanDraft>(key: K, value: TradePlanDraft[K]) => setDraft({ ...draft, [key]: value })
-  const marginInputMode = draft.initialMargin == null ? 'PERCENT' : 'AMOUNT'
-  return <section className="wb-panel wb-plan-section">
-    <div className="wb-section-head"><div><span className="wb-kicker">四价交易计划</span><h2>先写清楚计划，再等待人工成交</h2></div><span className={`wb-direction ${draft.direction.toLowerCase()}`}>{draft.direction === 'LONG' ? '做多计划' : '做空计划'}</span></div>
-    {!editable && <div className="wb-locked"><ShieldAlert/>计划已有真实成交，价格和仓位已锁定；请用下方人工确认动作继续。</div>}
+  const saveLabel = record.id && state === 'PLANNED' ? '更新当前计划' : isTerminalState(state) ? '创建下一笔计划' : '创建交易计划'
+  return <section className="v05-panel v05-plan-panel">
+    <PanelTitle kicker="计划模拟" title="四价与仓位计划" badge={<span className="v05-badge planned">计划</span>}/>
+    {!editable && <div className="v05-lock"><ShieldAlert/>已有人工确认成交，计划已锁定。</div>}
     <form onSubmit={onSave}>
-      <div className="wb-form-grid wb-four-prices">
-        <label className="wb-field"><span>方向</span><div><select value={draft.direction} disabled={!editable} onChange={event => set('direction', event.target.value as TradePlanDraft['direction'])}><option value="LONG">做多 LONG</option><option value="SHORT">做空 SHORT</option></select></div></label>
+      <div className="v05-plan-prices">
+        <label className="v05-field"><span>方向</span><div><select value={draft.direction} disabled={!editable} onChange={event => set('direction', event.target.value as TradePlanDraft['direction'])}><option value="LONG">做多 LONG</option><option value="SHORT">做空 SHORT</option></select></div></label>
         <NumberField label="初始开仓价" value={draft.initialEntryPrice} onChange={value => set('initialEntryPrice', value)} disabled={!editable} required suffix="USDT"/>
-        <NumberField label="第一压力位 / 加仓价" value={draft.addPrice} onChange={value => set('addPrice', value)} disabled={!editable} required suffix="USDT"/>
-        <NumberField label="第二压力位 / 硬止损价" value={draft.stopPrice} onChange={value => set('stopPrice', value)} disabled={!editable} required suffix="USDT"/>
+        <NumberField label="加仓价 / 第一压力位" value={draft.addPrice} onChange={value => set('addPrice', value)} disabled={!editable} required suffix="USDT"/>
+        <NumberField label="硬止损价 / 第二压力位" value={draft.stopPrice} onChange={value => set('stopPrice', value)} disabled={!editable} required suffix="USDT"/>
         <NumberField label="止盈价" value={draft.takeProfitPrice} onChange={value => set('takeProfitPrice', value)} disabled={!editable} required suffix="USDT"/>
       </div>
-      <div className="wb-form-divider"><span>仓位与成本</span></div>
-      <div className="wb-form-grid wb-settings-grid">
+      <div className="v05-plan-sizing">
         <NumberField label="账户权益" value={draft.equity} onChange={value => set('equity', value ?? 0)} disabled={!editable} required suffix="USDT"/>
         <NumberField label="杠杆" value={draft.leverage} onChange={value => set('leverage', value ?? 0)} disabled={!editable} min={1} step="1" required suffix="x"/>
-        <label className="wb-field"><span>初始保证金输入</span><div><select value={marginInputMode} disabled={!editable || draft.sizingMode === 'MAX_LOSS'} onChange={event => set('initialMargin', event.target.value === 'AMOUNT' ? draft.equity * draft.initialMarginPercent / 100 : null)}><option value="PERCENT">按权益比例</option><option value="AMOUNT">按 USDT 金额</option></select></div></label>
-        {marginInputMode === 'PERCENT' ? <NumberField label="初始保证金比例" value={draft.initialMarginPercent} onChange={value => set('initialMarginPercent', value ?? 0)} disabled={!editable || draft.sizingMode === 'MAX_LOSS'} required suffix="%"/> : <NumberField label="初始保证金金额" value={draft.initialMargin} onChange={value => set('initialMargin', value)} disabled={!editable || draft.sizingMode === 'MAX_LOSS'} required suffix="USDT"/>}
-        <NumberField label="加仓倍数（最多一次）" value={draft.addMultiplier} onChange={value => set('addMultiplier', value ?? 0)} disabled={!editable} required suffix="倍"/>
-        <label className="wb-field"><span>仓位计算方式</span><div><select value={draft.sizingMode} disabled={!editable} onChange={event => set('sizingMode', event.target.value as TradePlanDraft['sizingMode'])}><option value="MARGIN">按初始保证金</option><option value="MAX_LOSS">按最大亏损反推</option></select></div></label>
+        <NumberField label="初始保证金比例" value={draft.initialMarginPercent} onChange={value => set('initialMarginPercent', value ?? 0)} disabled={!editable || draft.sizingMode === 'MAX_LOSS'} required suffix="%"/>
+        <NumberField label="加仓倍数" value={draft.addMultiplier} onChange={value => set('addMultiplier', value ?? 0)} disabled={!editable} required suffix="倍"/>
         <NumberField label="最大允许亏损" value={draft.maxLossUsdt} onChange={value => setDraft({ ...draft, maxLossUsdt: value, lossLimitUsdt: value })} disabled={!editable} required={draft.sizingMode === 'MAX_LOSS'} suffix="USDT"/>
-        <label className="wb-field"><span>保证金模式</span><div><select value={draft.marginMode} disabled={!editable} onChange={event => set('marginMode', event.target.value as TradePlanDraft['marginMode'])}><option value="ISOLATED">逐仓 ISOLATED</option><option value="CROSS">全仓 CROSS</option></select></div></label>
-        <NumberField label="Maker 手续费" value={draft.makerFeeBps} onChange={value => set('makerFeeBps', value ?? 0)} disabled={!editable} suffix="bp"/>
-        <NumberField label="Taker 手续费" value={draft.takerFeeBps} onChange={value => set('takerFeeBps', value ?? 0)} disabled={!editable} suffix="bp"/>
-        <NumberField label="预计滑点" value={draft.slippageBps} onChange={value => set('slippageBps', value ?? 0)} disabled={!editable} suffix="bp"/>
-        <label className="wb-field wb-notes"><span>备注（可选）</span><textarea value={draft.notes} disabled={!editable} maxLength={4000} placeholder="写下入场理由、失效条件或需要克制的临场冲动" onChange={event => set('notes', event.target.value)}/></label>
       </div>
-      {orderError && <div className="wb-inline-error" role="alert"><AlertTriangle/>{orderError}</div>}
-      {risk?.errors.map(error => <div className="wb-inline-error" role="alert" key={error}><AlertTriangle/>{error}</div>)}
-      {editable && <button className="wb-primary" type="submit" disabled={saving || Boolean(orderError) || risk?.valid === false}>{saving ? <LoaderCircle className="spin"/> : <Save/>}{record.id && executionState === 'PLANNED' ? '更新当前计划' : terminal ? '创建下一笔计划' : '创建交易计划'}</button>}
+      <details className="v05-form-advanced">
+        <summary>仓位、强平参数与成本设置 <ChevronRight/></summary>
+        <div className="v05-advanced-grid">
+          <label className="v05-field"><span>保证金模式</span><div><select value={draft.marginMode} disabled={!editable} onChange={event => set('marginMode', event.target.value as TradePlanDraft['marginMode'])}><option value="CROSS">全仓 CROSS</option><option value="ISOLATED">逐仓 ISOLATED</option></select></div></label>
+          <label className="v05-field"><span>仓位计算方式</span><div><select value={draft.sizingMode} disabled={!editable} onChange={event => set('sizingMode', event.target.value as TradePlanDraft['sizingMode'])}><option value="MARGIN">按初始保证金</option><option value="MAX_LOSS">按最大亏损反推</option></select></div></label>
+          <NumberField label="初始保证金金额（可选）" value={draft.initialMargin} onChange={value => set('initialMargin', value)} disabled={!editable || draft.sizingMode === 'MAX_LOSS'} suffix="USDT"/>
+          <NumberField label="全仓可用权益" value={draft.crossAvailableEquity} onChange={value => set('crossAvailableEquity', value ?? 0)} disabled={!editable || draft.marginMode !== 'CROSS'} suffix="USDT"/>
+          <NumberField label="追加保证金" value={draft.extraMarginUsdt} onChange={value => set('extraMarginUsdt', value ?? 0)} disabled={!editable} suffix="USDT"/>
+          <label className="v05-field"><span>维持保证金参数</span><div><select value={draft.maintenanceMarginSource} disabled={!editable} onChange={event => set('maintenanceMarginSource', event.target.value as TradePlanDraft['maintenanceMarginSource'])}><option value="AUTO">OKX 公共参数 AUTO</option><option value="MANUAL">手动输入 MANUAL</option></select></div></label>
+          <NumberField label="维持保证金率" value={draft.maintenanceMarginRate} onChange={value => set('maintenanceMarginRate', value)} disabled={!editable || draft.maintenanceMarginSource !== 'MANUAL'} step="0.0001"/>
+          <NumberField label="维持保证金固定额" value={draft.maintenanceMarginFixedUsdt} onChange={value => set('maintenanceMarginFixedUsdt', value ?? 0)} disabled={!editable || draft.maintenanceMarginSource !== 'MANUAL'} suffix="USDT"/>
+          <NumberField label="预估强平费率" value={draft.liquidationFeeBps} onChange={value => set('liquidationFeeBps', value ?? 0)} disabled={!editable} suffix="bp"/>
+          <NumberField label="Maker 手续费" value={draft.makerFeeBps} onChange={value => set('makerFeeBps', value ?? 0)} disabled={!editable} suffix="bp"/>
+          <NumberField label="Taker 手续费" value={draft.takerFeeBps} onChange={value => set('takerFeeBps', value ?? 0)} disabled={!editable} suffix="bp"/>
+          <NumberField label="预计滑点" value={draft.slippageBps} onChange={value => set('slippageBps', value ?? 0)} disabled={!editable} suffix="bp"/>
+          <NumberField label="低风险上限" value={draft.riskLowMaxPercent} onChange={value => set('riskLowMaxPercent', value ?? 0)} disabled={!editable} suffix="%"/>
+          <NumberField label="中风险上限" value={draft.riskMediumMaxPercent} onChange={value => set('riskMediumMaxPercent', value ?? 0)} disabled={!editable} suffix="%"/>
+          <NumberField label="高风险上限" value={draft.riskHighMaxPercent} onChange={value => set('riskHighMaxPercent', value ?? 0)} disabled={!editable} suffix="%"/>
+          <SwitchField label="计入未结资金费" checked={draft.includeUnsettledFunding} onChange={value => set('includeUnsettledFunding', value)} disabled={!editable}/>
+          <NumberField label="未结资金费" value={draft.unsettledFundingUsdt} onChange={value => set('unsettledFundingUsdt', value ?? 0)} disabled={!editable || !draft.includeUnsettledFunding} suffix="USDT"/>
+          <SwitchField label="假设没有其他持仓" checked={draft.assumeNoOtherPositions} onChange={value => set('assumeNoOtherPositions', value)} disabled={!editable} hint="全仓估算的重要前提"/>
+          <label className="v05-field v05-notes"><span>备注（可选）</span><textarea value={draft.notes} disabled={!editable} maxLength={4000} placeholder="入场理由、失效条件或纪律提醒" onChange={event => set('notes', event.target.value)}/></label>
+        </div>
+      </details>
+      {orderError && <div className="v05-error" role="alert"><AlertTriangle/>{orderError}</div>}
+      {risk?.errors.map(error => <div className="v05-error" role="alert" key={error}><AlertTriangle/>{error}</div>)}
+      {editable && <button className="v05-primary" type="submit" disabled={saving || Boolean(orderError) || risk?.valid === false}>{saving ? <LoaderCircle className="spin"/> : <Save/>}{saveLabel}</button>}
     </form>
+    <div className="v05-summary-grid planned">
+      <Metric label="计划总数量" value={`${quantity(risk?.totalQuantityBtc)} BTC`}/>
+      <Metric label="计划保证金" value={`${money(risk?.totalMargin)} USDT`}/>
+      <Metric label="计划名义仓位" value={`${money(risk?.totalNotional)} USDT`}/>
+      <Metric label="计划加权均价" value={`${money(risk?.averageEntryPrice)} USDT`}/>
+      <Metric label="计划全成本保本价" value={`${money(risk?.fullCostBreakevenPrice ?? risk?.allInBreakevenPrice)} USDT`}/>
+      <Metric label="计划止损净亏损" value={`${money(risk?.netLossAtStop)} USDT`}/>
+      <Metric label="计划估算强平价" value={liquidationPrice(risk?.liquidationScenarios?.afterAdd)} hint="基于完成一次计划加仓的情景"/>
+    </div>
   </section>
 }
 
-function RiskDetails({ risk, plan, executionRisk, record }: { risk: RiskCalculation | null; plan: TradePlanDraft; executionRisk?: ExecutionRisk | null; record: TradePlanRecord }) {
-  if (!risk) return <section className="wb-panel wb-risk-details"><div className="wb-section-head"><div><span className="wb-kicker">加仓后风险详情</span><h2>等待风险计算</h2></div></div><div className="wb-chart-empty"><Calculator/>填写四价后由后端统一计算。</div></section>
-  const plannedFullCost = risk.fullCostBreakevenPrice ?? risk.allInBreakevenPrice ?? risk.feeAdjustedBreakevenPrice
-  const plannedRows: Array<[string, string]> = [
-    ['初始保证金', `${money(risk.initialMargin)} USDT`], ['加仓保证金', `${money(risk.addMargin)} USDT`], ['总使用保证金', `${money(risk.totalMargin)} USDT`],
-    ['初始名义仓位', `${money(risk.initialNotional)} USDT`], ['加仓名义仓位', `${money(risk.addNotional)} USDT`], ['总名义仓位', `${money(risk.totalNotional)} USDT`],
-    ['计划初始 BTC 数量', `${quantity(risk.initialQuantityBtc)} BTC`], ['计划加仓 BTC 数量', `${quantity(risk.addQuantityBtc)} BTC`], ['计划总 BTC 数量', `${quantity(risk.totalQuantityBtc)} BTC`],
-    ['计划减仓后剩余', `${quantity(risk.remainingQuantityAfterPlannedReduce)} BTC`], ['计划加权均价', `${money(risk.averageEntryPrice)} USDT`], ['计划毛保本价', `${money(risk.grossBreakevenPrice)} USDT`],
-    ['计划手续费保本价', `${money(risk.feeBreakevenPrice)} USDT`], ['计划全成本保本价', `${money(plannedFullCost)} USDT`], ['止盈位毛利润', `${money(risk.grossProfitAtTakeProfit)} USDT`],
-    ['止盈位预计净利润', `${money(risk.netProfitAtTakeProfit)} USDT`], ['止损位毛亏损', `${money(risk.grossLossAtStop)} USDT`], ['计划止损净亏损', `${money(risk.netLossAtStop)} USDT`],
-    ['开仓手续费', `${money(risk.openingFee)} USDT`], ['加仓手续费', `${money(risk.addFee)} USDT`], ['减仓手续费', `${money(risk.estimatedReduceFee)} USDT`],
-    ['最终平仓手续费', `${money(risk.estimatedCloseFee)} USDT`], ['止损总手续费', `${money(risk.totalFeesAtStop)} USDT`], ['止损预计滑点', `${money(risk.estimatedSlippageAtStop)} USDT`],
-    ['止盈预计滑点', `${money(risk.estimatedSlippageAtTakeProfit)} USDT`], ['盈亏比', risk.riskRewardRatio == null ? '—' : `1 : ${risk.riskRewardRatio.toFixed(2)}`], ['反推最大初始保证金', `${money(risk.maxInitialMarginByLoss)} USDT`],
-  ]
-  const execution = record.executionSummary ?? record.execution
+function ActualExecutionPanel({ record }: { record: TradePlanRecord }) {
   const fills = record.actualFills ?? {}
-  const actualRows: Array<[string, string]> = execution && executionRisk ? [
-    ['实际初始成交数量', `${quantity(fills.initial?.quantityBtc)} BTC`],
-    ['实际加仓成交数量', `${quantity(fills.add?.quantityBtc)} BTC`],
-    ['实际累计开仓数量', `${quantity(execution.openedQuantityBtc)} BTC`],
-    ['实际剩余数量', `${quantity(execution.remainingQuantityBtc)} BTC`],
-    ['实际加权均价', `${money(executionRisk.averageEntryPrice)} USDT`],
-    ['实际毛保本价', `${money(executionRisk.grossBreakevenPrice)} USDT`],
-    ['实际手续费保本价', `${money(executionRisk.feeBreakevenPrice)} USDT`],
-    ['实际全成本保本价', `${money(executionRisk.fullCostBreakevenPrice)} USDT`],
-    ['实际剩余仓位到止损净亏损', `${money(executionRisk.remainingNetLossAtStop)} USDT`],
-    ['实际到止损总盈亏', `${money(executionRisk.totalNetPnlIfStopped)} USDT`],
-    ['实际止损风险占权益', percent(executionRisk.maxLossEquityPercent)],
-    ['实际已实现净盈亏', `${money(execution.realizedNetPnl)} USDT`],
-  ] : []
-  return <section className="wb-panel wb-risk-details">
-    <div className="wb-section-head"><div><span className="wb-kicker">风险详情</span><h2>计划数据与实际成交数据严格分区</h2></div><span className="wb-risk-pill">{executionRisk ? `实际风险：${actualRiskLevel(executionRisk.maxLossEquityPercent, plan)}` : `计划风险：${risk.riskLevel}`}</span></div>
-    <div className="wb-risk-subhead"><strong>计划数据</strong><span>由保存的计划和后端风险计算返回</span></div>
-    <div className="wb-risk-grid">{plannedRows.map(([label, value]) => <Metric key={label} label={label} value={value}/>)}</div>
-    {actualRows.length > 0 && <div className="wb-actual-risk-block">
-      <div className="wb-risk-subhead actual"><strong>实际成交数据</strong><span>仅由人工确认的 actualFills 和后端 executionRisk 返回</span></div>
-      <div className="wb-risk-grid actual">{actualRows.map(([label, value]) => <Metric key={label} label={label} value={value}/>)}</div>
-    </div>}
-    <div className="wb-adverse"><strong>加仓后继续反向移动</strong>{risk.adverseMoveLosses.map(row => <span key={row.movePercent}>反向 {row.movePercent}%：预计亏损 {money(row.lossUsdt)} USDT（权益 {percent(row.equityPercent)}）</span>)}</div>
-    {[...risk.warnings, ...(risk.liquidationWarning ? ['当前计划存在强平风险提示，请缩小仓位或调整止损。'] : []), ...(risk.lossLimitExceeded ? [`预计亏损超过你设定的 ${money(plan.maxLossUsdt)} USDT 上限。`] : [])].map(message => <div className="wb-warning" key={message}><AlertTriangle/>{message}</div>)}
-  </section>
-}
-
-function ExecutionPanel({ record }: { record: TradePlanRecord }) {
   const execution = record.executionSummary ?? record.execution
-  const fills = record.actualFills ?? {}
+  const executionRisk = record.executionRisk
+  const hasFills = Object.values(fills).some(Boolean)
   const fillLabels = { initial: '初始开仓', add: '加仓', reduce: '部分减仓', exit: '最终退出' } as const
-  return <section className="wb-panel wb-execution">
-    <div className="wb-section-head"><div><span className="wb-kicker">真实执行记录</span><h2>仅展示你人工确认的成交</h2></div><span className="wb-manual-badge"><CheckCircle2/>人工确认</span></div>
-    {Object.keys(fills).length ? <div className="wb-fill-list">{Object.entries(fills).map(([key, fill]) => fill && <div key={key}><span>{fillLabels[key as keyof typeof fillLabels] ?? key}</span><strong>{money(fill.price)} USDT</strong><small>{quantity(fill.quantityBtc)} BTC</small></div>)}</div> : <div className="wb-empty-small">尚无人工确认成交。行情触价不会写入这里。</div>}
-    {execution && <div className="wb-execution-summary"><Metric label="已实现净盈亏" value={`${money(execution.realizedNetPnl)} USDT`} tone={execution.realizedNetPnl >= 0 ? 'up' : 'down'}/><Metric label="剩余 BTC" value={`${quantity(execution.remainingQuantityBtc)} BTC`}/><Metric label="实际加权均价" value={`${money(execution.averageEntryPrice)} USDT`}/><Metric label="剩余入场成本" value={`${money(execution.remainingEntryCost)} USDT`}/><Metric label="累计费用" value={`${money(execution.fees)} USDT`}/><Metric label="累计滑点" value={`${money(execution.slippageUsdt)} USDT`}/></div>}
-    {execution && !execution.mfeMaeSupported && <div className="wb-info">分段减仓后 MFE/MAE 暂不支持，已隐藏可能误导的数值。</div>}
+  return <section className="v05-panel v05-actual-panel">
+    <PanelTitle kicker="实际成交" title="人工确认的真实记录" badge={<span className="v05-badge actual">实际</span>}/>
+    {!hasFills ? <div className="v05-actual-empty">尚无人工确认成交。实际区域不会使用计划数据代替。</div> : <>
+      <div className="v05-summary-grid actual">
+        <Metric label="实际累计开仓数量" value={`${quantity(execution?.openedQuantityBtc)} BTC`}/>
+        <Metric label="实际剩余数量" value={`${quantity(execution?.remainingQuantityBtc)} BTC`}/>
+        <Metric label="实际加权均价" value={`${money(executionRisk?.averageEntryPrice ?? execution?.averageEntryPrice)} USDT`}/>
+        <Metric label="实际已实现盈亏" value={`${money(execution?.realizedNetPnl)} USDT`} tone={(execution?.realizedNetPnl ?? 0) < 0 ? 'danger' : 'positive'}/>
+        <Metric label="实际手续费" value={`${money(execution?.incurredFees ?? execution?.fees)} USDT`}/>
+        <Metric label="实际全成本保本价" value={`${money(executionRisk?.fullCostBreakevenPrice)} USDT`}/>
+        <Metric label="实际到止损总盈亏" value={`${money(executionRisk?.totalNetPnlIfStopped)} USDT`} tone={(executionRisk?.totalNetPnlIfStopped ?? 0) < 0 ? 'danger' : undefined}/>
+        <Metric label="实际估算强平价" value={liquidationPrice(executionRisk?.liquidationEstimate)} hint="只使用人工确认成交和实际剩余量"/>
+      </div>
+      <div className="v05-fill-grid">{Object.entries(fills).map(([key, fill]) => fill && <div key={key}><span>{fillLabels[key as keyof typeof fillLabels] ?? key}</span><strong>{money(fill.price)} USDT</strong><small>{quantity(fill.quantityBtc)} BTC · {time(fill.confirmedAt)}</small></div>)}</div>
+      <div className="v05-realized">已实现净盈亏 <strong className={(execution?.realizedNetPnl ?? 0) >= 0 ? 'positive' : 'danger'}>{money(execution?.realizedNetPnl)} USDT</strong></div>
+    </>}
   </section>
 }
 
-function ActionsPanel({ record, onChanged }: { record: TradePlanRecord; onChanged: (record: TradePlanRecord, message: string) => void }) {
-  const executionState = canonicalExecutionState(record.state)
-  const legal = legalActionsForState(executionState)
-  const fillActions = legal.filter((action): action is FillAction => action !== 'CANCEL')
-  const [selected, setSelected] = useState<FillAction | null>(fillActions[0] ?? null)
-  const [price, setPrice] = useState<number | null>(null), [quantityBtc, setQuantity] = useState<number | null>(null), [note, setNote] = useState('')
-  const [submitting, setSubmitting] = useState(false), [error, setError] = useState('')
-  useEffect(() => { const next = fillActions[0] ?? null; setSelected(next) }, [executionState])
-  useEffect(() => { if (!selected || !record.plan) return; const values = prefillForAction(selected, record.plan, record.risk, record); setPrice(values.price || null); setQuantity(values.quantityBtc || null); setError('') }, [selected, record.id, executionState])
-  if (!record.id) return <section className="wb-panel wb-actions"><div className="wb-section-head"><div><span className="wb-kicker">当前可执行动作</span><h2>先创建计划</h2></div></div><div className="wb-empty-small">创建计划后，这里只会显示当前阶段允许的人工确认动作。</div></section>
-  if (isTerminalState(executionState)) return <section className="wb-panel wb-actions"><div className="wb-section-head"><div><span className="wb-kicker">当前可执行动作</span><h2>本计划已结束</h2></div></div><div className="wb-terminal"><CheckCircle2/>终态不再允许加仓或减仓。可在上方修改四价并创建下一笔计划。</div></section>
+function ManualActions({ record, onChanged }: { record: TradePlanRecord; onChanged: (record: TradePlanRecord, message: string) => void }) {
+  const state = canonicalExecutionState(record.state)
+  const actions = legalActionsForState(state)
+  const fillActions = actions.filter((action): action is FillAction => action !== 'CANCEL')
+  const [action, setAction] = useState<FillAction | null>(fillActions[0] ?? null)
+  const [price, setPrice] = useState<number | null>(null)
+  const [quantityBtc, setQuantityBtc] = useState<number | null>(null)
+  const [note, setNote] = useState('')
+  const [submitting, setSubmitting] = useState(false)
+  const [error, setError] = useState('')
+
+  useEffect(() => {
+    const next = fillActions.includes(action as FillAction) ? action : fillActions[0] ?? null
+    setAction(next)
+    if (!next || !record.plan) {
+      setPrice(null)
+      setQuantityBtc(null)
+      return
+    }
+    const value = prefillForAction(next, normalizedPlan(record.plan), record.risk, record)
+    setPrice(value.price || null)
+    setQuantityBtc(value.quantityBtc || null)
+  }, [record.id, record.state, fillActions.join('|')])
+
+  const chooseAction = (next: FillAction) => {
+    setAction(next)
+    if (!record.plan) return
+    const value = prefillForAction(next, normalizedPlan(record.plan), record.risk, record)
+    setPrice(value.price || null)
+    setQuantityBtc(value.quantityBtc || null)
+  }
+
   const submit = async (event: FormEvent) => {
     event.preventDefault()
-    if (!selected || !record.id || price == null || price <= 0 || quantityBtc == null || quantityBtc <= 0) return setError('实际成交价格和实际 BTC 数量都必须大于 0。')
+    if (!record.id || !action || price == null || quantityBtc == null) return
     setSubmitting(true); setError('')
-    try { const response = await workbenchApi.action(record.id, { action: selected, price, quantityBtc, note }); onChanged(response.plan, `${ACTION_LABELS[selected]}已记录`) }
-    catch (reason) { setError(reason instanceof Error ? reason.message : '提交失败') }
+    try {
+      const response = await workbenchApi.action(record.id, { action, price, quantityBtc, note })
+      onChanged(response.plan, `${ACTION_LABELS[action]}已记录`)
+      setNote('')
+    } catch (reason) { setError(reason instanceof Error ? reason.message : '人工确认失败') }
     finally { setSubmitting(false) }
   }
   const cancel = async () => {
-    if (!record.id || !window.confirm('确定取消这笔尚未成交的计划？')) return
+    if (!record.id || !window.confirm('确认取消这笔尚未开仓的计划？')) return
     setSubmitting(true); setError('')
-    try { const response = await workbenchApi.action(record.id, { action: 'CANCEL', note }); onChanged(response.plan, '计划已取消') }
+    try { const response = await workbenchApi.action(record.id, { action: 'CANCEL' }); onChanged(response.plan, '计划已取消') }
     catch (reason) { setError(reason instanceof Error ? reason.message : '取消失败') }
     finally { setSubmitting(false) }
   }
-  return <section className="wb-panel wb-actions">
-    <div className="wb-section-head"><div><span className="wb-kicker">当前可执行动作</span><h2>真实成交必须由你填写并确认</h2></div><span className="wb-manual-badge"><CheckCircle2/>不会自动下单</span></div>
-    {fillActions.length > 0 && <div className="wb-action-tabs">{fillActions.map(action => <button key={action} type="button" className={selected === action ? 'active' : ''} onClick={() => setSelected(action)}>{ACTION_LABELS[action]}</button>)}</div>}
-    {selected && <form className="wb-action-form" onSubmit={submit}>
-      <NumberField label="实际成交价格" value={price} onChange={setPrice} required suffix="USDT"/>
-      <NumberField label="实际成交 BTC 数量" value={quantityBtc} onChange={setQuantity} step="any" required suffix="BTC"/>
-      <label className="wb-field"><span>本次成交备注（可选）</span><div><input value={note} maxLength={2000} onChange={event => setNote(event.target.value)}/></div></label>
-      <button className="wb-primary" type="submit" disabled={submitting}>{submitting ? <LoaderCircle className="spin"/> : <CheckCircle2/>}{ACTION_LABELS[selected]}</button>
-    </form>}
-    {legal.includes('CANCEL') && <button type="button" className="wb-cancel" onClick={cancel} disabled={submitting}>取消计划</button>}
-    {error && <div className="wb-inline-error" role="alert"><AlertTriangle/>{error}</div>}
+
+  return <section className="v05-panel v05-actions-panel">
+    <PanelTitle kicker="人工操作" title="只显示当前状态允许的动作" badge={<span className="v05-badge actual"><CheckCircle2/>人工确认</span>}/>
+    {!record.id ? <div className="v05-empty">先创建计划，随后才能人工确认真实成交。</div>
+      : isTerminalState(state) ? <div className="v05-terminal"><CheckCircle2/>本计划已结束，不再显示加仓或减仓动作。</div>
+        : !fillActions.length ? <div className="v05-empty">当前没有需要填写成交价格和数量的动作。</div>
+          : <>
+            <div className="v05-action-tabs">{fillActions.map(value => <button key={value} type="button" className={action === value ? 'active' : ''} onClick={() => chooseAction(value)}>{ACTION_LABELS[value]}</button>)}</div>
+            <form className="v05-action-form" onSubmit={submit}>
+              <NumberField label="实际成交价格" value={price} onChange={setPrice} required suffix="USDT"/>
+              <NumberField label="实际成交 BTC 数量" value={quantityBtc} onChange={setQuantityBtc} required step="any" suffix="BTC"/>
+              <label className="v05-field"><span>本次确认备注</span><div><input value={note} maxLength={2000} onChange={event => setNote(event.target.value)}/></div></label>
+              <button className="v05-primary" disabled={submitting || price == null || quantityBtc == null}>{submitting ? <LoaderCircle className="spin"/> : <CheckCircle2/>}{action ? ACTION_LABELS[action] : '确认'}</button>
+            </form>
+          </>}
+    {actions.includes('CANCEL') && <button className="v05-cancel" type="button" onClick={cancel} disabled={submitting}>取消尚未开仓的计划</button>}
+    {error && <div className="v05-error" role="alert"><AlertTriangle/>{error}</div>}
   </section>
 }
 
-function ReminderPanel({ reminder }: { reminder: ActiveReminder | null | undefined }) {
-  return <section className={`wb-panel wb-reminder ${reminder ? 'active' : ''}`}>
-    <div className="wb-section-head"><div><span className="wb-kicker">当前行情提醒</span><h2>{reminder ? '需要你检查并决定是否操作' : '当前没有待处理提醒'}</h2></div><span className="wb-not-fill"><AlertOctagon/>提醒不是成交</span></div>
-    {reminder ? <div className="wb-reminder-body"><strong>{reminder.message}</strong><span>触发参考价 {money(reminder.price)} USDT · {time(reminder.createdAt)}</span><p>行情触及价格只会显示提醒，不会改变真实成交状态、不会写入 actualFills，也不会创建最终交易日志。</p></div> : <div className="wb-empty-small">系统会在接近开仓、加仓、减仓、止盈或止损区域时提醒；仍需你在上方手工确认实际价格和 BTC 数量。</div>}
-  </section>
+function LiquidationScenario({ label, value }: { label: string; value: LiquidationEstimate | null | undefined }) {
+  return <div className="v05-liquidation-row"><strong>{label}</strong>{liquidationAvailable(value) ? <>
+    <span>{money(value.estimatedLiquidationPrice)} USDT</span>
+    <small>距标记价 {percent(value.distancePercent)} · 止损距强平 {percent(value.hardStopBufferPercent)} · {value.hardStopSequence === 'STOP_FIRST' ? '预计止损先触发' : value.hardStopSequence === 'UNAVAILABLE' ? '止损顺序不可用' : '强平可能早于或紧邻止损'}{value.changeFromPreviousUsdt == null ? '' : ` · 较上一情景 ${value.changeFromPreviousUsdt >= 0 ? '+' : ''}${money(value.changeFromPreviousUsdt)} USDT`} · {value.parameterSource} · 参数更新 {time(value.parametersUpdatedAt)}</small>
+  </> : <><span>不可用</span><small>{value?.errors?.[0] ?? value?.warnings?.[0] ?? '后端没有返回可用估算'}</small></>}</div>
+}
+
+function AdvancedDetails({ risk, record }: { risk: RiskCalculation | null; record: TradePlanRecord }) {
+  const execution = record.executionSummary ?? record.execution
+  const executionRisk = record.executionRisk
+  return <details className="v05-advanced-details">
+    <summary><span><strong>高级风险与成本详情</strong><small>手续费、滑点、情景强平和计算假设</small></span><ChevronRight/></summary>
+    <div className="v05-advanced-content">
+      <div className="v05-detail-grid">
+        <Metric label="计划初始保证金" value={`${money(risk?.initialMargin)} USDT`}/>
+        <Metric label="计划加仓保证金" value={`${money(risk?.addMargin)} USDT`}/>
+        <Metric label="计划总名义仓位" value={`${money(risk?.totalNotional)} USDT`}/>
+        <Metric label="计划开仓费" value={`${money(risk?.openingFee)} USDT`}/>
+        <Metric label="计划加仓费" value={`${money(risk?.addFee)} USDT`}/>
+        <Metric label="计划止损总费用" value={`${money(risk?.totalFeesAtStop)} USDT`}/>
+        <Metric label="计划止损滑点" value={`${money(risk?.estimatedSlippageAtStop)} USDT`}/>
+        <Metric label="风险回报比" value={risk?.riskRewardRatio == null ? '—' : `1 : ${risk.riskRewardRatio.toFixed(2)}`}/>
+        <Metric label="实际累计费用" value={`${money(execution?.incurredFees ?? execution?.fees)} USDT`}/>
+        <Metric label="实际累计滑点" value={`${money(execution?.slippageUsdt)} USDT`}/>
+        <Metric label="实际已实现净盈亏" value={`${money(execution?.realizedNetPnl)} USDT`}/>
+        <Metric label="实际剩余止损净亏损" value={`${money(executionRisk?.remainingNetLossAtStop ?? executionRisk?.netLossAtStop)} USDT`}/>
+      </div>
+      <div className="v05-liquidation-scenarios">
+        <h3>计划强平情景</h3>
+        <LiquidationScenario label="仅初始开仓" value={risk?.liquidationScenarios?.initialOnly}/>
+        <LiquidationScenario label="完成计划加仓" value={risk?.liquidationScenarios?.afterAdd}/>
+        <LiquidationScenario label="计划减仓后" value={risk?.liquidationScenarios?.afterPlannedReduce}/>
+        {record.executionRisk?.liquidationEstimate && <LiquidationScenario label="当前实际仓位" value={record.executionRisk.liquidationEstimate}/>}
+      </div>
+      {risk?.adverseMoveLosses?.length ? <div className="v05-adverse"><h3>计划加仓后的反向移动</h3>{risk.adverseMoveLosses.map(row => <span key={row.movePercent}>反向 {row.movePercent}%：{money(row.lossUsdt)} USDT（权益 {percent(row.equityPercent)}）</span>)}</div> : null}
+      {[...(risk?.warnings ?? []), ...(risk?.assumptions ?? [])].map(message => <div className="v05-note" key={message}>{message}</div>)}
+    </div>
+  </details>
 }
 
 export default function WorkbenchView() {
-  const [snapshot, setSnapshot] = useState(EMPTY_SNAPSHOT), [record, setRecord] = useState<TradePlanRecord>(EMPTY_RECORD)
-  const [draft, setDraft] = useState<TradePlanDraft>({ ...DEFAULT_PLAN }), [risk, setRisk] = useState<RiskCalculation | null>(null)
-  const [loading, setLoading] = useState(true), [saving, setSaving] = useState(false), [serviceError, setServiceError] = useState(''), [calculationError, setCalculationError] = useState(''), [toast, setToast] = useState('')
+  const [snapshot, setSnapshot] = useState<MarketSnapshot>(EMPTY_SNAPSHOT)
+  const [record, setRecord] = useState<TradePlanRecord>(EMPTY_RECORD)
+  const [draft, setDraft] = useState<TradePlanDraft>(DEFAULT_PLAN)
+  const [risk, setRisk] = useState<RiskCalculation | null>(null)
+  const [timeframe, setTimeframe] = useState<ChartTimeframe>('1H')
+  const [loading, setLoading] = useState(true)
+  const [saving, setSaving] = useState(false)
   const [socketConnected, setSocketConnected] = useState(false)
-  const didRestore = useRef(false), latestDraft = useRef(draft)
-  latestDraft.current = draft
-  const applyRecord = useCallback((next: TradePlanRecord, restoreDraft = false) => {
-    const normalized = { ...next, state: canonicalExecutionState(next.state) }
-    setRecord(normalized); if (normalized.risk) setRisk(normalized.risk)
-    if (normalized.plan && (restoreDraft || normalized.state === 'PLANNED')) setDraft(normalized.plan)
+  const [serviceError, setServiceError] = useState('')
+  const [calculationError, setCalculationError] = useState('')
+  const [toast, setToast] = useState('')
+  const latestDraft = useRef(draft)
+
+  const applyRecord = useCallback((next: TradePlanRecord, syncDraft = false) => {
+    const normalized = { ...next, plan: next.plan ? normalizedPlan(next.plan) : null }
+    setRecord(normalized)
+    if (syncDraft && normalized.plan) {
+      setDraft(normalized.plan)
+      setRisk(normalized.risk)
+    }
   }, [])
   const load = useCallback(async () => {
-    const results = await Promise.allSettled([workbenchApi.snapshot(), workbenchApi.current()])
-    if (results[0].status === 'fulfilled') setSnapshot(results[0].value)
-    if (results[1].status === 'fulfilled') { applyRecord(results[1].value, !didRestore.current); didRestore.current = true }
-    setServiceError(results.some(result => result.status === 'rejected') ? '本地服务部分接口暂不可用，正在保留已显示内容并重试。' : '')
-    setLoading(false)
+    setLoading(true); setServiceError('')
+    try {
+      const [market, current] = await Promise.all([workbenchApi.snapshot(), workbenchApi.current()])
+      setSnapshot(market); applyRecord(current, true)
+    } catch (reason) { setServiceError(reason instanceof Error ? reason.message : '工作台加载失败') }
+    finally { setLoading(false) }
   }, [applyRecord])
-  useEffect(() => { load(); const timer = window.setInterval(load, 60_000); return () => window.clearInterval(timer) }, [load])
+
+  useEffect(() => { void load() }, [load])
   useEffect(() => {
-    const timer = window.setTimeout(() => { workbenchApi.calculate(draft).then(value => { if (latestDraft.current === draft) { setRisk(value); setCalculationError('') } }).catch(reason => { if (latestDraft.current === draft) setCalculationError(reason instanceof Error ? reason.message : '风险计算失败') }) }, 250)
+    latestDraft.current = draft
+    const timer = window.setTimeout(() => {
+      workbenchApi.calculate(draft).then(value => {
+        if (latestDraft.current === draft) { setRisk(value); setCalculationError('') }
+      }).catch(reason => { if (latestDraft.current === draft) setCalculationError(reason instanceof Error ? reason.message : '风险计算失败') })
+    }, 250)
     return () => window.clearTimeout(timer)
   }, [draft])
   useEffect(() => {
-    let socket: WebSocket | null = null, retry = 0, retryTimer = 0, stopped = false
+    if (!toast) return
+    const timer = window.setTimeout(() => setToast(''), 4_000)
+    return () => window.clearTimeout(timer)
+  }, [toast])
+  useEffect(() => {
+    let socket: WebSocket | null = null
+    let retry = 0
+    let retryTimer = 0
+    let stopped = false
     const connect = () => {
       const protocol = location.protocol === 'https:' ? 'wss' : 'ws'
       socket = new WebSocket(`${protocol}://${location.host}/ws/live`)
@@ -206,67 +331,141 @@ export default function WorkbenchView() {
           if (message.type === 'ready') { retry = 0; setSocketConnected(true) }
           if (message.type === 'market') {
             const tickerTime = Number(message.tickerTime)
-            setSnapshot(current => ({ ...current, price: typeof message.price === 'number' ? message.price : current.price, updatedAt: Number.isFinite(tickerTime) ? tickerTime : current.updatedAt, connectionStatus: typeof message.connectionStatus === 'string' ? message.connectionStatus : current.connectionStatus, stale: Number.isFinite(tickerTime) ? Date.now() - tickerTime > 30_000 : current.stale }))
+            const markPriceTime = Number(message.markPriceTime)
+            setSnapshot(current => ({
+              ...current,
+              price: typeof message.price === 'number' ? message.price : current.price,
+              markPrice: typeof message.markPrice === 'number' ? message.markPrice : current.markPrice,
+              markPriceTime: Number.isFinite(markPriceTime) ? markPriceTime : current.markPriceTime,
+              updatedAt: Number.isFinite(tickerTime) ? tickerTime : current.updatedAt,
+              connectionStatus: typeof message.connectionStatus === 'string' ? message.connectionStatus : current.connectionStatus,
+              stale: Number.isFinite(tickerTime) ? Date.now() - tickerTime > 30_000 : current.stale,
+            }))
+          }
+          if (message.type === 'candle' && isMarketTimeframe(message.timeframe) && Array.isArray(message.candles)) {
+            const candles = message.candles.map(normalizeCandle).filter((candle): candle is Candle => candle != null)
+            if (candles.length) setSnapshot(current => withRealtimeCandles(current, message.timeframe as MarketTimeframe, candles, Boolean(message.gapDetected)))
+          }
+          if (message.type === 'riskParameters') {
+            workbenchApi.calculate(latestDraft.current).then(value => setRisk(value)).catch(() => undefined)
+            workbenchApi.current().then(next => applyRecord(next)).catch(() => undefined)
           }
           if (message.type === 'tradePlanAlert') {
             if (message.plan && typeof message.plan === 'object') applyRecord(message.plan as TradePlanRecord)
             else workbenchApi.current().then(next => applyRecord(next)).catch(() => undefined)
             if (typeof message.message === 'string') setToast(message.message)
           }
-        } catch { /* 忽略损坏的实时帧，下一次 REST 同步会恢复。 */ }
+          if (message.type === 'tradePlanUpdate' && message.plan && typeof message.plan === 'object') {
+            const next = message.plan as TradePlanRecord
+            applyRecord(next)
+            if (canonicalExecutionState(next.state) === 'PLANNED') setRisk(next.risk)
+          }
+        } catch { /* 下一次 REST 同步会修复损坏帧。 */ }
       }
     }
     connect()
     return () => { stopped = true; window.clearTimeout(retryTimer); socket?.close() }
   }, [applyRecord])
+
   const save = async (event: FormEvent) => {
     event.preventDefault()
     const localError = priceOrderError(draft)
     if (localError) return setCalculationError(localError)
     setSaving(true); setServiceError('')
     try {
-      const executionState = canonicalExecutionState(record.state)
-      const next = record.id && executionState === 'PLANNED' ? await workbenchApi.update(record.id, draft) : await workbenchApi.create(draft)
-      applyRecord(next, true); setToast(record.id && executionState === 'PLANNED' ? '计划已更新' : '计划已创建，等待你确认真实开仓')
+      const state = canonicalExecutionState(record.state)
+      const next = record.id && state === 'PLANNED' ? await workbenchApi.update(record.id, draft) : await workbenchApi.create(draft)
+      applyRecord(next, true)
+      setToast(record.id && state === 'PLANNED' ? '计划已更新' : '计划已创建，等待人工确认真实开仓')
     } catch (reason) { setServiceError(reason instanceof Error ? reason.message : '保存计划失败') }
     finally { setSaving(false) }
   }
+
   const executionState = canonicalExecutionState(record.state)
-  const startingNextPlan = Boolean(record.id && isTerminalState(executionState) && record.plan && JSON.stringify(draft) !== JSON.stringify(record.plan))
-  const currentRisk = record.id && executionState !== 'PLANNED' && !isTerminalState(executionState) ? record.risk : risk
-  const hasActualFills = Object.keys(record.actualFills ?? {}).length > 0
-  const executionRisk: ExecutionRisk | null = hasActualFills && !startingNextPlan ? record.executionRisk ?? null : null
-  const direction = record.plan?.direction ?? draft.direction
-  const equityPercent = executionRisk?.maxLossEquityPercent ?? currentRisk?.maxLossEquityPercent
-  const netLoss = Math.abs(executionRisk?.netLossAtStop ?? currentRisk?.netLossAtStop ?? 0)
-  const age = snapshot.updatedAt == null ? '尚无行情时间' : `${Math.max(0, Math.round((Date.now() - snapshot.updatedAt) / 1000))} 秒前`
+  const terminal = isTerminalState(executionState)
+  const activeLockedPlan = Boolean(record.id && executionState !== 'PLANNED' && !terminal && record.plan)
+  const displayPlan = activeLockedPlan ? normalizedPlan(record.plan) : draft
+  const currentRisk = activeLockedPlan ? record.risk : risk
+  const hasActualFills = Object.values(record.actualFills ?? {}).some(Boolean)
+  const executionRisk: ExecutionRisk | null = hasActualFills ? record.executionRisk ?? null : null
+  const execution = record.executionSummary ?? record.execution
+  const plannedLiquidation = currentRisk?.liquidationScenarios?.afterAdd ?? currentRisk?.liquidationScenarios?.initialOnly
+  const activeLiquidation = executionRisk?.liquidationEstimate ?? plannedLiquidation
+  const actualRiskPercent = executionRisk?.maxLossEquityPercent
+  const equityPercent = actualRiskPercent ?? currentRisk?.maxLossEquityPercent
+  const actualStopPnl = executionRisk?.totalNetPnlIfStopped
+  const stopLoss = hasActualFills ? Math.abs(Math.min(0, actualStopPnl ?? -(executionRisk?.netLossAtStop ?? 0))) : currentRisk?.netLossAtStop
+  const currentPrice = snapshot.price ?? snapshot.markPrice
+  const updatedAt = snapshot.updatedAt ?? snapshot.markPriceTime
   const marketConnected = socketConnected && snapshot.connectionStatus === 'connected' && !snapshot.stale
-  const chartPlan = record.id && executionState !== 'PLANNED' && (!isTerminalState(executionState) || !startingNextPlan) && record.plan ? record.plan : draft
+  const startingNextPlan = Boolean(terminal && record.plan && JSON.stringify(draft) !== JSON.stringify(record.plan))
   const chartActualFills = startingNextPlan ? {} : record.actualFills ?? {}
-  const riskTone = currentRisk?.lossLimitExceeded || currentRisk?.liquidationWarning || (chartPlan.maxLossUsdt != null && netLoss > chartPlan.maxLossUsdt) ? 'danger' : 'normal'
+  const chartExecutionRisk = startingNextPlan ? null : executionRisk
+  const displayedRiskLevel = hasActualFills ? executionRisk?.riskLevel : currentRisk?.riskLevel
+  const danger = Boolean(currentRisk?.lossLimitExceeded || displayedRiskLevel === '极高' || liquidationDanger(activeLiquidation))
+  const reminder = record.activeReminder
   const updateAfterAction = (next: TradePlanRecord, message: string) => { applyRecord(next, true); setToast(message) }
-  const primaryStatus = useMemo(() => STATE_LABELS[executionState], [executionState])
-  return <main className="workbench-page">
-    {serviceError && <div className="wb-service-error" role="alert"><AlertTriangle/><span>{serviceError}</span><button onClick={load}>重试</button></div>}
-    <section className="wb-market-status">
-      <div className="wb-price"><span>{snapshot.instrument}</span><strong>{snapshot.price == null ? '—' : `$${money(snapshot.price)}`}</strong><small>{age}</small></div>
-      <div className={`wb-connection ${marketConnected ? 'online' : ''}`}>{marketConnected ? <Wifi/> : <WifiOff/>}<span><strong>{connectionLabel(snapshot.connectionStatus)}</strong><small>{socketConnected ? '本地实时通道已连接' : '本地实时通道重连中'}</small></span></div>
-      <div className="wb-state"><span>实际执行状态</span><strong>{primaryStatus}</strong><small>{direction === 'LONG' ? '当前计划：做多' : '当前计划：做空'} · 只由人工成交确认改变</small></div>
-      <button className="wb-refresh" aria-label="刷新行情和当前计划" onClick={load} disabled={loading}><RefreshCw className={loading ? 'spin' : ''}/></button>
+  const timeframeStatus = snapshot.candleStatus?.[timeframe as MarketTimeframe]
+
+  return <main className="v05-workbench">
+    {serviceError && <div className="v05-service-error" role="alert"><AlertTriangle/><span>{serviceError}</span><button onClick={load}>重试</button></div>}
+
+    <section className="v05-status-strip" aria-label="当前交易状态">
+      <div><span>当前 BTC 价格</span><strong>{currentPrice == null ? '—' : `$${money(currentPrice)}`}</strong><small>标记价 {money(snapshot.markPrice)} USDT</small></div>
+      <div><span>当前周期</span><strong>{timeframe}</strong><small>{timeframeStatus?.gapDetected ? '检测到缺口' : timeframeStatus?.stale ? '数据过期' : '可用'}</small></div>
+      <div className={marketConnected ? 'connected' : 'disconnected'}><span>公共行情连接</span><strong>{marketConnected ? <Wifi/> : <WifiOff/>}{marketConnected ? '已连接' : connectionLabel(socketConnected ? snapshot.connectionStatus : 'reconnecting')}</strong></div>
+      <div><span>更新时间</span><strong>{time(updatedAt)}</strong><small>{updatedAt ? `${Math.max(0, Math.round((Date.now() - updatedAt) / 1000))} 秒前` : '暂无时间'}</small></div>
+      <div><span>实际执行状态</span><strong>{STATE_LABELS[executionState]}</strong></div>
+      <div className={reminder ? 'reminder' : ''}><span>当前行情提醒</span><strong>{reminder?.message ?? '暂无提醒'}</strong>{reminder && <small>{money(reminder.price)} USDT · {time(reminder.createdAt)}</small>}</div>
+      <button className="v05-refresh" aria-label="刷新行情和当前计划" onClick={load} disabled={loading}><RefreshCw className={loading ? 'spin' : ''}/></button>
     </section>
-    <section className={`wb-risk-hero ${riskTone}`}>
-      <div><span>最重要的风险数字</span><h1>{executionRisk ? '实际仓位到第二压力位整笔预计净亏损' : '计划到第二压力位预计净亏损'} <strong>{currentRisk?.valid ? money(netLoss) : '—'} USDT</strong></h1><p>这是手续费和预计滑点后的估算，不是“使用 4% 保证金就只承担 4% 风险”。</p></div>
-      <div className="wb-risk-hero-side"><Metric label="占账户权益" value={percent(equityPercent)}/><Metric label="风险等级" value={executionRisk ? actualRiskLevel(equityPercent, chartPlan) : currentRisk?.riskLevel ?? '等待计算'}/><Metric label="最大允许亏损" value={`${money(chartPlan.maxLossUsdt)} USDT`}/><Metric label="反推最大初始保证金" value={`${money(currentRisk?.maxInitialMarginByLoss)} USDT`}/></div>
+
+    <section className="v05-core-grid" aria-label="四个核心风险指标">
+      <div className={`v05-core-card ${danger ? 'danger' : ''}`}><span>{hasActualFills ? '实际止损净亏损' : '计划止损净亏损'}</span><strong>{money(stopLoss)} USDT</strong><small>包含后端费用与滑点估算</small></div>
+      <div className={`v05-core-card ${danger ? 'danger' : ''}`}><span>{hasActualFills ? '实际风险占权益' : '计划风险占权益'}</span><strong>{percent(equityPercent)} · {displayedRiskLevel ?? '等待计算'}</strong><small>当前阈值：{displayPlan.riskLowMaxPercent}% / {displayPlan.riskMediumMaxPercent}% / {displayPlan.riskHighMaxPercent}%</small></div>
+      <div className={`v05-core-card ${liquidationDanger(activeLiquidation) ? 'danger' : ''}`}><span>{hasActualFills ? '实际估算强平价' : '计划估算强平价'}</span><strong>{liquidationAvailable(activeLiquidation) ? `${money(activeLiquidation.estimatedLiquidationPrice)} USDT` : '不可用'}</strong><small>{liquidationDistanceAvailable(activeLiquidation) ? `距标记价 ${percent(activeLiquidation.distancePercent)} · ${activeLiquidation.distanceRisk}` : activeLiquidation?.warnings?.find(message => message.includes('标记价格')) ?? activeLiquidation?.errors?.[0] ?? '标记价距离不可用'}</small><small>参数 {activeLiquidation?.parameterSource ?? 'UNAVAILABLE'} · 更新 {time(activeLiquidation?.parametersUpdatedAt)}</small></div>
+      <div className="v05-core-card actual"><span>{hasActualFills ? '实际剩余数量' : '计划总数量'}</span><strong>{quantity(hasActualFills ? execution?.remainingQuantityBtc : currentRisk?.totalQuantityBtc)} BTC</strong><small>{hasActualFills ? '来自人工确认成交' : '尚无实际成交，明确显示计划量'}</small></div>
     </section>
-    {calculationError && <div className="wb-inline-error wb-global-error" role="alert"><AlertTriangle/>{calculationError}</div>}
-    <PlanForm draft={draft} setDraft={setDraft} record={record} risk={risk} saving={saving} onSave={save}/>
-    <section className="wb-panel wb-chart-section"><div className="wb-section-head"><div><span className="wb-kicker">1H / 4H K 线与计划价格线</span><h2>四价、后端加权均价与全成本保本价</h2></div><span className="wb-live-label">公共行情 · 只读</span></div><TradingPlanChart candles1h={snapshot.candles1h} candles4h={snapshot.candles4h} timeframe="1H" currentPrice={snapshot.price} plan={chartPlan} plannedRisk={currentRisk} executionRisk={executionRisk} actualFills={chartActualFills} stale={snapshot.stale} connectionStatus={socketConnected ? snapshot.connectionStatus : 'reconnecting'}/></section>
-    <RiskDetails risk={currentRisk} plan={chartPlan} executionRisk={executionRisk} record={record}/>
-    <ActionsPanel record={record} onChanged={updateAfterAction}/>
-    <ReminderPanel reminder={record.activeReminder}/>
-    <ExecutionPanel record={record}/>
-    <section className="wb-research-entry"><span>需要查看旧方向评分、新闻和三年回测？</span><strong>请使用页面顶部“研究区”入口。它们是实验信号，三年回测未通过，不会改变本计划。</strong></section>
-    <footer className="wb-footer"><span>仅使用 OKX 公共和免鉴权行情，不读取账户、不自动下单。</span><span>真实状态、实际成交和最终日志只在你明确确认后记录。</span></footer>
-    {toast && <div className="wb-toast" role="status" onAnimationEnd={() => setToast('')}><CheckCircle2/>{toast}</div>}
+
+    <p className="v05-estimate-disclaimer">本工具没有读取OKX账户，强平价为基于当前输入和公开规则的估算，以OKX实际显示为准。</p>
+
+    {liquidationDanger(activeLiquidation) && <div className="v05-critical-warning" role="alert"><AlertTriangle/>按当前估算，仓位可能在计划止损生效前进入强平区域。</div>}
+
+    {calculationError && <div className="v05-error v05-global-error" role="alert"><AlertTriangle/>{calculationError}</div>}
+
+    <section className="v05-panel v05-chart-panel">
+      <PanelTitle kicker="主图" title="四周期蜡烛图与计划 / 实际价格线" badge={<span className="v05-badge readonly">公共行情 · 只读</span>}/>
+      <TradingPlanChart
+        candles1m={snapshot.candles1m} candles15m={snapshot.candles15m} candles1h={snapshot.candles1h} candles4h={snapshot.candles4h}
+        timeframe={timeframe} onTimeframeChange={setTimeframe} currentPrice={currentPrice} plan={displayPlan}
+        plannedRisk={currentRisk} executionRisk={chartExecutionRisk} actualFills={chartActualFills}
+        stale={snapshot.stale} connectionStatus={socketConnected ? snapshot.connectionStatus : 'reconnecting'} candleStatus={snapshot.candleStatus}
+      />
+    </section>
+
+    <section className="v05-comparison" aria-label="计划模拟与实际成交对比">
+      <PlanSimulationPanel draft={draft} setDraft={setDraft} record={record} risk={currentRisk} saving={saving} onSave={save}/>
+      <ActualExecutionPanel record={record}/>
+    </section>
+
+    <section className="v05-workflow-grid">
+      <ManualActions record={record} onChanged={updateAfterAction}/>
+      <aside className="v05-panel v05-risk-explanation">
+        <PanelTitle kicker="风险解释" title="损失比例与强平距离是两套指标"/>
+        <div className="v05-risk-tier-grid">
+          <div><strong>低风险</strong><span>单笔止损对账户影响较小；连续亏损仍需控制；不代表交易胜率更高。</span></div>
+          <div><strong>中风险</strong><span>一次止损会产生明显回撤；连续两三次止损应缩小仓位；不适合临时扩大止损。</span></div>
+          <div><strong>高风险</strong><span>会明显影响后续交易空间并可能吃掉多次小额盈利；加仓前须重查强平距离和亏损金额。</span></div>
+          <div><strong>极高风险</strong><span>单次失败可能造成严重回撤；高杠杆下滑点或止损失效风险更高；这里只警告，不会替你修改计划。</span></div>
+        </div>
+        <p>风险等级只描述“到硬止损时预计损失占权益的比例”，不代表行情成功概率，也不构成盈利保证。</p>
+        <p><strong>强平距离独立判断：</strong>估算强平价、距离风险和硬止损先后顺序只渲染后端结果；硬止损不等于交易所一定能在强平前成交。</p>
+        {activeLiquidation?.warnings?.map(message => <div className="v05-warning" key={message}><AlertTriangle/>{message}</div>)}
+      </aside>
+    </section>
+
+    <AdvancedDetails risk={currentRisk} record={record}/>
+    <footer className="v05-footer">仅使用 OKX 公共和免鉴权行情；不读取账户、不自动下单。实际状态与成交记录只在你明确确认后改变。</footer>
+    {toast && <div className="v05-toast" role="status"><CheckCircle2/>{toast}</div>}
   </main>
 }

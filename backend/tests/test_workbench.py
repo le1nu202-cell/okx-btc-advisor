@@ -232,6 +232,17 @@ def test_confirmations_require_price_and_quantity_and_terminal_blocks_more_actio
         ))
 
 
+def test_open_execution_reports_all_incurred_entry_fees_without_realizing_them():
+    record = make_plan_record(plan(maker_fee_bps=2, taker_fee_bps=5))
+    opened, _ = apply_action(record, TradeActionRequest(
+        action=TradeAction.CONFIRM_INITIAL, price=100, quantity_btc=0.4,
+    ))
+    execution = opened["execution"]
+    assert execution["incurredFees"] == pytest.approx(100 * 0.4 * 2 / 10_000)
+    assert execution["fees"] == pytest.approx(0)
+    assert execution["realizedNetPnl"] == pytest.approx(0)
+
+
 def test_market_triggers_only_persist_reminders_and_stale_data_does_nothing():
     planned = make_plan_record(plan())
     stale, event, _ = price_trigger(planned, 100, False)

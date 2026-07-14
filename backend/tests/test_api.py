@@ -20,7 +20,7 @@ def test_health_and_camel_case_contract():
         health=client.get("/api/health")
         assert health.status_code==200
         assert health.json()["appId"]=="okx-btc-advisor"
-        assert health.json()["version"]=="0.4.0" and health.json()["instrument"]=="BTC-USDT-SWAP"
+        assert health.json()["version"]=="0.5.0" and health.json()["instrument"]=="BTC-USDT-SWAP"
         body=client.get("/api/market/snapshot").json()
         assert "candles1H" in body and "connectionStatus" in body and "fundingRate" in body
         missing=client.get("/api/not-a-real-endpoint")
@@ -250,16 +250,16 @@ async def test_periodic_rest_reconciliation_repairs_silent_candle_channels(monke
     monkeypatch.setattr(main.client,"candles",fake_candles)
     monkeypatch.setattr(main,"publish_current_signal",fake_publish)
     assert await main.reconcile_market_once() is False
-    assert calls==[("1H",False),("4H",False)] and published==[]
+    assert calls==[("1m",False),("15m",False),("1H",False),("4H",False)] and published==[]
 
     async def rows(instrument,tf,limit,history):
         calls.append((tf,history))
         return [Candle(timestamp=1,open=1,high=2,low=.5,close=1.5,volume=1,timeframe=tf,confirm=True)]
     stored=[]
     monkeypatch.setattr(main.client,"candles",rows)
-    monkeypatch.setattr(main.db,"upsert_candles",lambda instrument,value:stored.extend(value))
+    monkeypatch.setattr(main.db,"upsert_candles",lambda instrument,value,retention_before=None:stored.extend(value))
     assert await main.reconcile_market_once() is True
-    assert {item.timeframe for item in stored}=={"1H","4H"} and published==[True]
+    assert {item.timeframe for item in stored}=={"1m","15m","1H","4H"} and published==[True]
 
 
 @pytest.mark.asyncio

@@ -20,11 +20,12 @@
 
 ## 组件边界
 
-- `frontend/src/components/TradingPlanChart.tsx` 只负责 Lightweight Charts 生命周期、1H/4H 显示、交互、价格线和成交标记。
+- `frontend/src/components/TradingPlanChart.tsx` 只负责 Lightweight Charts 生命周期、1m/15m/1H/4H 显示、交互、价格线和成交标记；同一实例在周期间复用，每个周期只在第一次进入时 `fitContent`。
 - `frontend/src/chart-adapter.ts` 只负责确定性数据转换和后端字段到图表元素的映射。
+- `frontend/src/components/TradeEquityChart.tsx` 使用同一开源包的 `AreaSeries` 展示后端权威累计净值；前端不重新累计单笔盈亏。
 - 风险、加权均价、全成本保本价和止损盈亏不在图表中重算；它们来自 `RiskCalculation` / `ExecutionRisk` 后端字段。
 - 成交标记只遍历 `actualFills`。`activeReminder` 和行情事件不是成交标记数据源。
-- 新确认成交写入可选 `confirmedAt` JSON 元数据；旧 SQLite 记录没有该字段时，兼容回退到当前周期的最后一根可见 K 线，不需要 SQLite schema migration。
+- 新确认成交写入可选 `confirmedAt` JSON 元数据；标记只锚定到对应周期最近的已收盘 K 线。旧 SQLite 记录没有该字段时，兼容回退到最后一根已收盘可见 K 线，不需要 SQLite schema migration。
 
 ## 生命周期与交互
 
@@ -32,6 +33,7 @@
 - 价格线使用 `series.createPriceLine`，当前价通过 `IPriceLine.applyOptions` 更新。
 - 成交标记使用 `createSeriesMarkers`。
 - 毫秒时间戳在适配层转换为升序、去重的 UNIX 秒 `UTCTimestamp`。
+- WebSocket 增量 K 线按时间戳覆盖、排序并保持有界；同周期调用 `setData` 不执行 `fitContent`，所以实时刷新不会重置用户缩放和平移。
 - 缩放、平移和十字光标使用正式的 `handleScale`、`handleScroll` 与 `CrosshairMode.Normal` 配置。
 - 宽度/高度由容器 `ResizeObserver` 同步；组件卸载时断开 observer 并调用一次 `chart.remove()`。
 

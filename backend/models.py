@@ -115,13 +115,25 @@ class Settings(APIModel):
         return value
 
 
+class CandleSeriesStatus(APIModel):
+    available: bool = False
+    stale: bool = True
+    last_at: int | None = None
+    gap_detected: bool = False
+
+
 class MarketSnapshot(APIModel):
     instrument: str
     price: float | None
     updated_at: str
     stale: bool
+    candles_1m: list[Candle] = Field(default_factory=list)
+    candles_15m: list[Candle] = Field(default_factory=list)
     candles_1h: list[Candle]
     candles_4h: list[Candle]
+    mark_price: float | None = None
+    mark_price_time: int | None = None
+    candle_status: dict[str, CandleSeriesStatus] = Field(default_factory=dict)
     funding_rate: float | None
     funding_time: int | None
     open_interest: float | None

@@ -25,6 +25,11 @@ class MarginMode(str, Enum):
     CROSS = "CROSS"
 
 
+class MaintenanceMarginSource(str, Enum):
+    AUTO = "AUTO"
+    MANUAL = "MANUAL"
+
+
 class SizingMode(str, Enum):
     MARGIN = "MARGIN"
     MAX_LOSS = "MAX_LOSS"
@@ -94,7 +99,16 @@ class TradePlanDraft(APIModel):
     maker_fee_bps: float = Field(default=2.0, ge=0, le=100)
     taker_fee_bps: float = Field(default=5.0, ge=0, le=100)
     slippage_bps: float = Field(default=5.0, ge=0, le=500)
-    margin_mode: MarginMode = MarginMode.ISOLATED
+    margin_mode: MarginMode = MarginMode.CROSS
+    cross_available_equity: float | None = Field(default=None, ge=0, le=1_000_000_000)
+    extra_margin_usdt: float = Field(default=0.0, ge=0, le=1_000_000_000)
+    maintenance_margin_source: MaintenanceMarginSource = MaintenanceMarginSource.AUTO
+    maintenance_margin_rate: float | None = Field(default=None, ge=0, lt=1)
+    maintenance_margin_fixed_usdt: float = Field(default=0.0, ge=0, le=1_000_000_000)
+    liquidation_fee_bps: float = Field(default=5.0, ge=0, le=1_000)
+    include_unsettled_funding: bool = False
+    unsettled_funding_usdt: float = Field(default=0.0, ge=-1_000_000_000, le=1_000_000_000)
+    assume_no_other_positions: bool = True
     sizing_mode: SizingMode = SizingMode.MARGIN
     max_loss_usdt: float | None = Field(default=None, gt=0, le=1_000_000_000)
     loss_limit_usdt: float | None = Field(default=None, gt=0, le=1_000_000_000)
@@ -180,6 +194,7 @@ class RiskCalculation(APIModel):
     risk_level: str = "未知"
     loss_limit_exceeded: bool = False
     liquidation_warning: bool = False
+    liquidation_scenarios: dict[str, Any] | None = None
     assumptions: list[str] = Field(default_factory=list)
 
 
@@ -594,6 +609,7 @@ def recompute_execution(record: dict[str, Any]) -> dict[str, Any]:
         "allocatedEntryFees": allocated_entry_fees,
         "exitFees": exit_fees,
         "fees": allocated_entry_fees + exit_fees,
+        "incurredFees": total_entry_fees + exit_fees,
         "slippageUsdt": slippage,
         "realizedNetPnl": realized_gross - allocated_entry_fees - exit_fees,
         "mfeMaeSupported": "reduce" not in fills,
@@ -651,6 +667,7 @@ def recompute_execution(record: dict[str, Any]) -> dict[str, Any]:
             "maxLossEquityPercent": max(0.0, -total_if_stopped) / plan.equity * 100,
             "totalNetPnlIfStopped": total_if_stopped,
         })
+    execution_risk["riskLevel"] = _risk_level(float(execution_risk["maxLossEquityPercent"]), plan)
     updated = dict(record)
     updated["actualFills"] = fills
     updated["realizedSegments"] = segments
@@ -916,6 +933,7 @@ def build_trade_log(record: dict[str, Any], source: str = "live", regime: str | 
         "initialMargin": risk.initial_margin,
         "addMargin": risk.add_margin if add_q > 0 else 0,
         "leverage": plan.leverage,
+        "startingEquity": plan.equity,
         "makerFeeBps": plan.maker_fee_bps,
         "takerFeeBps": plan.taker_fee_bps,
         "slippageBps": plan.slippage_bps,
@@ -923,6 +941,7 @@ def build_trade_log(record: dict[str, Any], source: str = "live", regime: str | 
         "fees": execution["fees"],
         "slippageUsdt": execution["slippageUsdt"],
         "netPnl": execution["realizedNetPnl"],
+        "accountReturnPercent": execution["realizedNetPnl"] / plan.equity * 100,
         "execution": execution,
         "executionRisk": updated["executionRisk"],
         "realizedSegments": updated["realizedSegments"],
@@ -939,9 +958,19 @@ def build_trade_log(record: dict[str, Any], source: str = "live", regime: str | 
 
 
 def trade_statistics(logs: list[dict[str, Any]]) -> dict[str, Any]:
-    closed = [row for row in logs if isinstance(row.get("netPnl"), (int, float))]
+    def finite_number(value: Any) -> float | None:
+        if isinstance(value, bool):
+            return None
+        try:
+            number = float(value)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        return number if math.isfinite(number) else None
+
+    closed = [row for row in logs if finite_number(row.get("netPnl")) is not None]
     profits = [float(row["netPnl"]) for row in closed if float(row["netPnl"]) > 0]
     losses = [float(row["netPnl"]) for row in closed if float(row["netPnl"]) < 0]
+    breakeven = [row for row in closed if float(row["netPnl"]) == 0]
     added = [row for row in closed if row.get("addTriggered")]
     direct_tp = [row for row in closed if not row.get("addTriggered") and row.get("state") == TradeState.TAKE_PROFIT.value]
     reduced = [row for row in added if row.get("returnedToReduceZone")]
@@ -951,28 +980,45 @@ def trade_statistics(logs: list[dict[str, Any]]) -> dict[str, Any]:
     max_drawdown = 0.0
     streak = 0
     max_streak = 0
-    for row in sorted(closed, key=lambda item: int(item.get("closedAt") or 0)):
+    chronological = sorted(closed, key=lambda item: (int(item.get("closedAt") or 0), str(item.get("id") or "")))
+    # v0.4 logs did not persist startingEquity.  A later v0.5 baseline cannot
+    # be moved backwards across older PnL without inventing historical account
+    # state.  Only the chronologically earliest closed log may establish the
+    # absolute-equity baseline; cumulative PnL remains available either way.
+    starting_equity = finite_number(chronological[0].get("startingEquity")) if chronological else None
+    equity_curve: list[dict[str, Any]] = []
+    for row in chronological:
         pnl = float(row["netPnl"])
         equity += pnl
         peak = max(peak, equity)
         max_drawdown = max(max_drawdown, peak - equity)
         streak = streak + 1 if pnl < 0 else 0
         max_streak = max(max_streak, streak)
-    gross_profit = sum(profits)
-    gross_loss = abs(sum(losses))
-    total_fees = sum(float(row.get("fees") or 0) for row in closed)
+        equity_curve.append({
+            "timestamp": int(row.get("closedAt") or 0),
+            "cumulativeNetPnl": equity,
+            "equity": starting_equity + equity if starting_equity is not None else None,
+        })
+    gross_profit = math.fsum(profits)
+    gross_loss = abs(math.fsum(losses))
+    total_fees = math.fsum(finite_number(row.get("fees")) or 0.0 for row in closed)
+    total_slippage = math.fsum(finite_number(row.get("slippageUsdt")) or 0.0 for row in closed)
 
     def subset(rows: list[dict[str, Any]]) -> dict[str, Any]:
         values = [float(row["netPnl"]) for row in rows]
         return {
             "trades": len(rows),
-            "netPnl": sum(values),
+            "netPnl": math.fsum(values),
             "winRate": sum(value > 0 for value in values) / len(values) if values else None,
             "averagePnl": sum(values) / len(values) if values else None,
         }
 
     return {
         "totalTrades": len(closed),
+        "winningTrades": len(profits),
+        "losingTrades": len(losses),
+        "breakevenTrades": len(breakeven),
+        "winRate": len(profits) / len(closed) if closed else None,
         "initialDirectTakeProfitRate": len(direct_tp) / len(closed) if closed else None,
         "addTriggerRate": len(added) / len(closed) if closed else None,
         "returnToReduceZoneRate": len(reduced) / len(added) if added else None,
@@ -981,10 +1027,17 @@ def trade_statistics(logs: list[dict[str, Any]]) -> dict[str, Any]:
         "averageLoss": sum(losses) / len(losses) if losses else None,
         "profitFactor": gross_profit / gross_loss if gross_loss > 0 else None,
         "totalFees": total_fees,
+        "totalSlippage": total_slippage,
         "feesToGrossProfit": total_fees / gross_profit if gross_profit > 0 else None,
         "maxConsecutiveLosses": max_streak,
         "maxDrawdownUsdt": max_drawdown,
-        "netPnl": sum(float(row["netPnl"]) for row in closed),
+        "netPnl": math.fsum(float(row["netPnl"]) for row in closed),
+        "startingEquity": starting_equity,
+        "simulatedEquity": starting_equity + equity if starting_equity is not None else None,
+        "equityCurve": equity_curve,
+        "addTriggeredCount": len(added),
+        "returnedToReduceZoneCount": len(reduced),
+        "stoppedAfterAddCount": len(stopped_after_add),
         "byDirection": {
             "LONG": subset([row for row in closed if row.get("direction") == "LONG"]),
             "SHORT": subset([row for row in closed if row.get("direction") == "SHORT"]),

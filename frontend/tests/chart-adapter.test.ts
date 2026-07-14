@@ -20,22 +20,23 @@ describe('chart-adapter', () => {
   it('六条计划线直接使用后端 plannedRisk 字段', () => {
     const lines = buildPlanPriceLines(shortPlan, plannedRisk, null)
     expect(lines.map(line => [line.id, line.price, line.title])).toEqual([
-      ['initial-entry', 100_000, '初始开仓价'],
-      ['add', 101_000, '第一压力位 / 加仓价'],
-      ['stop', 102_000, '第二压力位 / 硬止损价'],
-      ['take-profit', 99_000, '止盈价'],
-      ['average-entry', plannedRisk.averageEntryPrice, '计划加权均价'],
-      ['full-cost-breakeven', plannedRisk.fullCostBreakevenPrice, '计划全成本保本价'],
+      ['planned-initial-entry', 100_000, '计划 · 初始开仓价'],
+      ['planned-add', 101_000, '计划 · 加仓价'],
+      ['planned-stop', 102_000, '计划 · 硬止损价'],
+      ['planned-take-profit', 99_000, '计划 · 止盈价'],
+      ['planned-average-entry', plannedRisk.averageEntryPrice, '计划 · 加权均价'],
+      ['planned-full-cost-breakeven', plannedRisk.fullCostBreakevenPrice, '计划 · 全成本保本价'],
     ])
   })
 
-  it('有真实成交后使用 executionRisk 权威均价和保本价，不根据 fills 重算', () => {
+  it('实际线使用 executionRisk 权威均价和保本价，并与六条计划线同时保留', () => {
     const lines = buildPlanPriceLines(shortPlan, plannedRisk, executionRisk)
-    const average = lines.find(line => line.id === 'average-entry')
-    const breakeven = lines.find(line => line.id === 'full-cost-breakeven')
+    const average = lines.find(line => line.id === 'actual-average-entry')
+    const breakeven = lines.find(line => line.id === 'actual-full-cost-breakeven')
 
-    expect(average).toMatchObject({ price: 100_777.123456, title: '实际加权均价' })
-    expect(breakeven).toMatchObject({ price: 100_910.987654, title: '实际全成本保本价' })
+    expect(lines.filter(line => line.group === 'planned')).toHaveLength(6)
+    expect(average).toMatchObject({ group: 'actual', price: 100_777.123456, title: '实际 · 加权均价' })
+    expect(breakeven).toMatchObject({ group: 'actual', price: 100_910.987654, title: '实际 · 全成本保本价' })
   })
 
   it('成交标记只由 actualFills 生成，并按成交时间和动作顺序确定', () => {

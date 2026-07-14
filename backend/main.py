@@ -18,16 +18,18 @@ from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnec
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
+from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, Response
 from fastapi.staticfiles import StaticFiles
 
 from .backtest import run_backtest
 from .db import Database
 from .models import AdviceAction, BacktestRequest, BacktestStatus, Candle, MarketRegime, MarketSnapshot, Settings, SignalAdvice
 from .news import NewsAggregator, aggregate_news
-from .okx import OKXPublicClient
+from .liquidation import DEFAULT_MARK_PRICE_MAX_AGE_MS, actual_liquidation_estimate, planned_liquidation_scenarios
+from .okx import ANALYSIS_TIMEFRAMES, CANDLE_TIMEFRAMES, CHANNEL_TO_TIMEFRAME, CHART_TIMEFRAMES, OKXPublicClient
 from .strategy import analyze, estimate_risk
 from .technical import analyze_technical
+from .trade_history import BulkDeleteTradeLogsRequest, encode_trade_log_csv, encode_trade_log_json
 from .workbench import (
     TERMINAL_STATES,
     ReplayCreateRequest,
@@ -55,10 +57,15 @@ from .workbench import (
 
 INSTRUMENT="BTC-USDT-SWAP"
 APP_ID="okx-btc-advisor"
-APP_VERSION="0.4.0"
+APP_VERSION="0.5.0"
 MAX_WEBSOCKET_CONNECTIONS=32
 NEWS_POLL_SECONDS=300
 NEWS_SOURCE_STALE_MS=15*60_000
+PUBLIC_RISK_CACHE_KEY="okx-public-risk:BTC-USDT-SWAP:cross"
+PUBLIC_RISK_REFRESH_MS=6*3600_000
+PUBLIC_RISK_MAX_STALE_MS=7*86400_000
+MARK_PRICE_STALE_MS=DEFAULT_MARK_PRICE_MAX_AGE_MS
+LIQUIDATION_REFRESH_MIN_INTERVAL_MS=1_000
 ROOT=Path(__file__).resolve().parents[1]
 db=Database(os.getenv("OKX_ADVISOR_DB",str(Path(__file__).with_name("data")/"advisor.db")))
 client=OKXPublicClient(base_url=os.getenv("OKX_BASE_URL","https://www.okx.com"),ws_url=os.getenv("OKX_WS_URL","wss://ws.okx.com:8443/ws/v5/public"),business_ws_url=os.getenv("OKX_BUSINESS_WS_URL","wss://ws.okx.com:8443/ws/v5/business"))
@@ -66,13 +73,51 @@ def _empty_news(message="新闻源正在连接"):
     return {"items":[],"analysis":{"asOf":None,"windowHours":48,"score":0,"articleCount":0,"status":"unavailable","sourceCoverage":0,"sourceStatus":[],"rawImpact":0,"coverageAdjustedImpact":0,"reason":"新闻数据不可用，严格按中性处理","warnings":[message]}}
 
 
-runtime={"price":None,"ticker_ts":None,"connection":"starting","stream_status":{"public":"starting","candles":"starting"},"stop":None,"task":None,"bootstrap_task":None,"resync_task":None,"reconcile_task":None,"news_task":None,"backtest_tasks":set(),"news":_empty_news(),"news_source_status":[],"news_checked":False,"news_last_success":None,"plan_check_ts":0}
+runtime={"price":None,"ticker_ts":None,"mark_price":None,"mark_price_ts":None,"connection":"starting","stream_status":{"public":"starting","candles":"starting"},"candle_gaps":{timeframe:False for timeframe in CHART_TIMEFRAMES},"candle_gap_targets":{timeframe:None for timeframe in CHART_TIMEFRAMES},"stop":None,"task":None,"bootstrap_task":None,"resync_task":None,"reconcile_task":None,"news_task":None,"intraday_backfill_task":None,"risk_parameter_task":None,"backtest_tasks":set(),"news":_empty_news(),"news_source_status":[],"news_checked":False,"news_last_success":None,"plan_check_ts":0,"liquidation_refresh_ts":0}
 subscribers:set[WebSocket]=set()
 pending_websockets=0
 news_aggregator=NewsAggregator()
 backtest_lock=asyncio.Lock()
 trade_plan_lock=threading.RLock()
 backtest_executor:ProcessPoolExecutor|None=None
+
+
+def _public_risk_context(now:int|None=None) -> dict|None:
+    current=int(now or time.time()*1000)
+    try:cached=db.get_public_market_cache(PUBLIC_RISK_CACHE_KEY)
+    except (AttributeError,TypeError,ValueError):return None
+    if not cached:return None
+    updated=int(cached.get("updatedAt") or cached.get("observedAt") or 0)
+    age=current-updated
+    if updated<=0 or age< -60_000 or age>PUBLIC_RISK_MAX_STALE_MS:return None
+    if not isinstance(cached.get("tiers"),list) or not cached.get("contractValueBtc"):return None
+    return {**cached,"stale":age>PUBLIC_RISK_REFRESH_MS}
+
+
+def _risk_with_liquidation(plan:TradePlanDraft,risk:RiskCalculation|dict,*,evaluated_at:int|None=None) -> dict:
+    evaluation_time=int(evaluated_at if evaluated_at is not None else now_ms())
+    payload=risk.model_dump(by_alias=True,mode="json") if isinstance(risk,RiskCalculation) else dict(risk)
+    payload["liquidationScenarios"]=planned_liquidation_scenarios(
+        plan.model_dump(by_alias=True,mode="json"),payload,
+        mark_price=runtime.get("mark_price"),mark_price_time=runtime.get("mark_price_ts"),
+        public_context=_public_risk_context(evaluation_time),evaluated_at=evaluation_time,
+    )
+    return payload
+
+
+def _enrich_record_liquidation(record:dict,*,evaluated_at:int|None=None) -> dict:
+    evaluation_time=int(evaluated_at if evaluated_at is not None else now_ms())
+    updated=dict(record)
+    plan=TradePlanDraft.model_validate(updated["plan"])
+    risk=RiskCalculation.model_validate(updated["risk"])
+    updated["risk"]=_risk_with_liquidation(plan,risk,evaluated_at=evaluation_time)
+    execution_risk=dict(updated.get("executionRisk") or {})
+    execution_risk["liquidationEstimate"]=actual_liquidation_estimate(
+        updated,mark_price=runtime.get("mark_price"),mark_price_time=runtime.get("mark_price_ts"),
+        public_context=_public_risk_context(evaluation_time),evaluated_at=evaluation_time,
+    )
+    updated["executionRisk"]=execution_risk
+    return updated
 
 
 def _backtest_process_pool()->ProcessPoolExecutor:
@@ -253,7 +298,19 @@ def _save_terminal_trade_log(record:dict,source:str="live") -> dict|None:
     else:
         try:regime=current_advice().regime.value
         except Exception:regime="UNKNOWN"
-    log=build_trade_log(record,source,regime)
+    if source=="live":
+        enriched=_enrich_record_liquidation(record)
+    else:
+        enriched=recompute_execution(record)
+        replay_risk=dict(enriched.get("executionRisk") or {})
+        replay_risk["liquidationEstimate"]=actual_liquidation_estimate(
+            enriched,mark_price=None,mark_price_time=None,public_context=_public_risk_context(),
+        )
+        enriched["executionRisk"]=replay_risk
+    log=build_trade_log(enriched,source,regime)
+    # build_trade_log intentionally rebuilds the frozen execution accounting;
+    # restore the independent liquidation post-processing projection.
+    log["executionRisk"]=enriched["executionRisk"]
     log["id"]=record["logId"]
     db.save_trade_plan(record,active=True) if source=="live" else None
     db.save_trade_log(log,source)
@@ -265,7 +322,7 @@ async def evaluate_active_plan_price(price:float|None) -> None:
     now=int(time.time()*1000)
     if now-int(runtime.get("plan_check_ts") or 0)<1000:return
     runtime["plan_check_ts"]=now
-    alert=None
+    alert=None;plan_update=None
     try:
         with trade_plan_lock:
             stored_record=db.get_active_trade_plan()
@@ -282,15 +339,43 @@ async def evaluate_active_plan_price(price:float|None) -> None:
                 favorable,adverse=candle_mark_to_market(updated,mark)
                 updated["mfeUsdt"]=max(float(updated.get("mfeUsdt") or 0),favorable)
                 updated["maeUsdt"]=max(float(updated.get("maeUsdt") or 0),adverse)
+            updated=_enrich_record_liquidation(recompute_execution(updated),evaluated_at=now)
             changed=record!=stored_record or updated!=record
             if changed:db.save_trade_plan(updated,active=True)
             if event:
                 db.save_trade_plan_event(updated["id"],before_state,updated["state"],event,float(price),{"message":message})
                 alert={"type":"tradePlanAlert","event":event,"message":message,"plan":updated,"log":None}
+            elif changed:
+                plan_update={"type":"tradePlanUpdate","reason":"TICKER_REFRESH","plan":updated}
     except (TypeError,ValueError,ArithmeticError):
         # A damaged local plan must never break public market ingestion.
         return
     if alert:await broadcast(alert)
+    elif plan_update:await broadcast(plan_update)
+
+
+async def refresh_active_plan_liquidation(*,reason:str="MARK_PRICE",evaluated_at:int|None=None,force:bool=False) -> dict|None:
+    """Persist and publish backend-authoritative mark-relative risk fields.
+
+    OKX mark-price can update several times per second.  The latest value is
+    always retained in runtime, while this derived plan projection is limited
+    to one save/broadcast per second.
+    """
+    evaluation_time=int(evaluated_at if evaluated_at is not None else now_ms())
+    last=int(runtime.get("liquidation_refresh_ts") or 0)
+    if not force and evaluation_time-last<LIQUIDATION_REFRESH_MIN_INTERVAL_MS:return None
+    runtime["liquidation_refresh_ts"]=evaluation_time
+    try:
+        with trade_plan_lock:
+            stored=db.get_active_trade_plan()
+            if not stored:return None
+            normalized=normalize_live_execution_state(stored)
+            updated=_enrich_record_liquidation(recompute_execution(normalized),evaluated_at=evaluation_time)
+            if updated!=stored:db.save_trade_plan(updated,active=True)
+    except (TypeError,ValueError,ArithmeticError):
+        return None
+    await broadcast({"type":"tradePlanUpdate","reason":reason,"plan":updated})
+    return updated
 
 
 async def publish_current_signal():
@@ -316,6 +401,69 @@ def update_stream_status(stream_name:str|None,status:str)->str:
     return overall
 
 
+def _remember_candle_gap(timeframe:str,start:int,end:int) -> None:
+    """Keep the exact missing interval until persisted confirmed rows cover it."""
+    if timeframe not in CANDLE_TIMEFRAMES or end<=start:return
+    targets=runtime.setdefault("candle_gap_targets",{tf:None for tf in CHART_TIMEFRAMES})
+    current=targets.get(timeframe)
+    if current:
+        start=min(int(start),int(current[0]));end=max(int(end),int(current[1]))
+    targets[timeframe]=(int(start),int(end))
+    runtime.setdefault("candle_gaps",{})[timeframe]=True
+
+
+def _internal_candle_gaps(rows:list[Candle],timeframe:str) -> list[tuple[int,int]]:
+    step=int(CANDLE_TIMEFRAMES[timeframe]["durationMs"])
+    timestamps=sorted({int(row.timestamp) for row in rows if row.confirm and row.timeframe==timeframe})
+    return [(left,right) for left,right in zip(timestamps,timestamps[1:]) if right-left!=step]
+
+
+def _refresh_candle_gap_status(timeframe:str,received:list[Candle]|None=None) -> bool:
+    """Validate merged, recently closed candles instead of trusting REST success.
+
+    A detected boundary is retained separately from the boolean UI status. A
+    later 300-row response therefore cannot hide a still-uncovered older
+    boundary merely by pushing its left endpoint out of the recent query.
+    """
+    received=list(received or [])
+    for start,end in _internal_candle_gaps(received,timeframe):
+        _remember_candle_gap(timeframe,start,end)
+
+    # Include one more row than the largest REST page so the merge boundary is
+    # visible when a response contains a full 300 rows.
+    persisted=db.candles(INSTRUMENT,timeframe,301)
+    merged={row.timestamp:row for row in persisted if row.confirm and row.timeframe==timeframe}
+    for row in received:
+        if row.confirm and row.timeframe==timeframe:merged[row.timestamp]=row
+    recent=[merged[timestamp] for timestamp in sorted(merged)]
+    for start,end in _internal_candle_gaps(recent,timeframe):
+        _remember_candle_gap(timeframe,start,end)
+
+    targets=runtime.setdefault("candle_gap_targets",{tf:None for tf in CHART_TIMEFRAMES})
+    target=targets.get(timeframe)
+    if target:
+        start,end=int(target[0]),int(target[1])
+        segment={row.timestamp:row for row in db.candles_since(INSTRUMENT,timeframe,start,confirmed_only=True) if row.timestamp<=end}
+        for row in received:
+            if row.confirm and row.timeframe==timeframe and start<=row.timestamp<=end:segment[row.timestamp]=row
+        ordered=[segment[timestamp] for timestamp in sorted(segment)]
+        covered=(
+            bool(ordered) and ordered[0].timestamp==start and ordered[-1].timestamp==end
+            and not _internal_candle_gaps(ordered,timeframe)
+        )
+        if not covered:
+            runtime["candle_gaps"][timeframe]=True
+            return True
+        targets[timeframe]=None
+
+    # One successful row is not evidence that a previously reported gap was
+    # repaired. Two or more contiguous closed rows can clear a target-less
+    # transient error; an empty/unclosed response leaves the prior status alone.
+    if len(recent)>=2 and any(row.confirm and row.timeframe==timeframe for row in received):
+        runtime["candle_gaps"][timeframe]=False
+    return bool(runtime["candle_gaps"].get(timeframe))
+
+
 async def on_okx(msg:dict):
     stream_name=msg.get("stream") or msg.get("_stream")
     if msg.get("event")=="reconnecting":
@@ -332,21 +480,43 @@ async def on_okx(msg:dict):
             try:await publish_current_signal()
             except Exception:pass
         return
-    channel=msg.get("arg",{}).get("channel",""); data=msg.get("data",[]);valid=False
+    channel=msg.get("arg",{}).get("channel",""); data=msg.get("data",[]);valid=False;mark_updated=False
     if channel=="tickers" and data:
         parsed=client.parse_ticker(data[0])
         if parsed:
             valid=True
             if runtime["ticker_ts"] is None or parsed[1]>=runtime["ticker_ts"]:runtime["price"],runtime["ticker_ts"]=parsed
-    elif channel.startswith("candle"):
-        tf="1H" if channel=="candle1H" else "4H"; rows=client.parse_candles(data,tf)
-        previous=db.candles(INSTRUMENT,tf,1)
-        step=3600_000 if tf=="1H" else 4*3600_000
-        if previous and rows and min(row.timestamp for row in rows)>previous[-1].timestamp+step:
-            try:db.upsert_candles(INSTRUMENT,await client.candles(INSTRUMENT,tf,300,history=True))
+    elif channel=="mark-price" and data:
+        parsed=client.parse_mark_price(data[0])
+        if parsed:
+            valid=True
+            if runtime["mark_price_ts"] is None or parsed[1]>=runtime["mark_price_ts"]:
+                runtime["mark_price"],runtime["mark_price_ts"]=parsed;mark_updated=True
+    elif channel in CHANNEL_TO_TIMEFRAME:
+        tf=CHANNEL_TO_TIMEFRAME[channel]; rows=client.parse_candles(data,tf)
+        published_rows=list(rows)
+        previous=[row for row in db.candles(INSTRUMENT,tf,5) if row.confirm]
+        received_confirmed=[row for row in rows if row.confirm]
+        step=int(CANDLE_TIMEFRAMES[tf]["durationMs"])
+        if previous and received_confirmed and min(row.timestamp for row in received_confirmed)>previous[-1].timestamp+step:
+            _remember_candle_gap(tf,previous[-1].timestamp,min(row.timestamp for row in received_confirmed))
+            try:
+                repaired=await client.backfill_candles(INSTRUMENT,tf,previous[-1].timestamp)
+                retention=CANDLE_TIMEFRAMES[tf].get("retentionMs")
+                db.upsert_candles(INSTRUMENT,repaired,int(time.time()*1000)-int(retention) if retention else None)
+                published_rows=[*repaired,*rows]
             except Exception:pass
-        db.upsert_candles(INSTRUMENT,rows)
-        if rows and rows[-1].confirm:
+        retention=CANDLE_TIMEFRAMES[tf].get("retentionMs")
+        db.upsert_candles(INSTRUMENT,rows,int(time.time()*1000)-int(retention) if retention else None)
+        _refresh_candle_gap_status(tf,published_rows)
+        if published_rows:
+            await broadcast({
+                "type":"candle",
+                "timeframe":tf,
+                "candles":[row.model_dump(by_alias=True,mode="json") for row in published_rows],
+                "gapDetected":bool(runtime["candle_gaps"].get(tf)),
+            })
+        if rows and rows[-1].confirm and tf in ANALYSIS_TIMEFRAMES:
             await publish_current_signal()
         valid=bool(rows)
     elif channel=="funding-rate" and data:
@@ -355,7 +525,9 @@ async def on_okx(msg:dict):
         parsed=client.parse_open_interest(data[0])
         if parsed:db.upsert_oi(INSTRUMENT,*parsed);valid=True
     if valid:update_stream_status(stream_name,"connected")
-    await broadcast({"type":"market","price":runtime["price"],"tickerTime":runtime["ticker_ts"],"connectionStatus":runtime["connection"]})
+    await broadcast({"type":"market","price":runtime["price"],"tickerTime":runtime["ticker_ts"],"markPrice":runtime["mark_price"],"markPriceTime":runtime["mark_price_ts"],"connectionStatus":runtime["connection"]})
+    if mark_updated:
+        await refresh_active_plan_liquidation(reason="MARK_PRICE")
     if channel=="tickers" and valid:
         await evaluate_active_plan_price(runtime["price"])
 
@@ -363,16 +535,34 @@ async def on_okx(msg:dict):
 async def resync_market_history()->bool:
     """Restore the complete live-analysis warm-up set without starting another WS."""
     errors=[]
-    for tf in ("1H","4H"):
+    for tf in CHART_TIMEFRAMES:
         try:
-            rows=await client.candles(INSTRUMENT,tf,300,history=True);db.upsert_candles(INSTRUMENT,rows)
-        except Exception as exc:errors.append(f"{tf}:{type(exc).__name__}")
+            rows=await client.candles(INSTRUMENT,tf,300,history=True)
+            retention=CANDLE_TIMEFRAMES[tf].get("retentionMs")
+            db.upsert_candles(INSTRUMENT,rows,int(time.time()*1000)-int(retention) if retention else None)
+            if not any(row.confirm for row in rows):runtime["candle_gaps"][tf]=True
+            gap_detected=_refresh_candle_gap_status(tf,rows)
+            if rows:
+                await broadcast({
+                    "type":"candle","timeframe":tf,
+                    "candles":[row.model_dump(by_alias=True,mode="json") for row in rows],
+                    "gapDetected":gap_detected,
+                })
+        except Exception as exc:
+            runtime["candle_gaps"][tf]=True
+            errors.append(f"{tf}:{type(exc).__name__}")
     try:db.upsert_funding(INSTRUMENT,await client.backfill_funding_history(INSTRUMENT,int(time.time()*1000)-91*86400_000))
     except Exception as exc:errors.append(f"funding:{type(exc).__name__}")
     try:
         oi=await client.open_interest(INSTRUMENT)
         if oi:db.upsert_oi(INSTRUMENT,*oi)
     except Exception as exc:errors.append(f"oi:{type(exc).__name__}")
+    try:
+        mark=await client.mark_price(INSTRUMENT)
+        if mark:
+            runtime["mark_price"],runtime["mark_price_ts"]=mark
+            await refresh_active_plan_liquidation(reason="MARK_PRICE_RESYNC",force=True)
+    except Exception as exc:errors.append(f"mark:{type(exc).__name__}")
     try:
         tick=await client.ticker(INSTRUMENT)
         if tick:runtime["price"],runtime["ticker_ts"]=tick
@@ -384,21 +574,50 @@ async def resync_market_history()->bool:
 async def bootstrap():
     await resync_market_history()
     runtime["stop"]=asyncio.Event(); runtime["task"]=asyncio.create_task(client.stream(on_okx,runtime["stop"]))
+    runtime["intraday_backfill_task"]=asyncio.create_task(backfill_intraday_history())
+
+
+async def backfill_intraday_history()->bool:
+    """Fill chart retention windows after WS startup so live data is not delayed."""
+    complete=True
+    now=int(time.time()*1000)
+    for tf in ("1m","15m"):
+        retention=int(CANDLE_TIMEFRAMES[tf]["retentionMs"])
+        cutoff=now-retention
+        try:
+            rows=await client.backfill_candles(INSTRUMENT,tf,cutoff)
+            db.upsert_candles(INSTRUMENT,rows,cutoff)
+            if not any(row.confirm for row in rows):runtime["candle_gaps"][tf]=True
+            if _refresh_candle_gap_status(tf,rows):complete=False
+        except Exception:
+            runtime["candle_gaps"][tf]=True;complete=False
+    return complete
 
 
 async def reconcile_market_once()->bool:
     """Repair silent per-channel WS stalls using the public current-candle REST view."""
-    refreshed=False
-    for tf in ("1H","4H"):
+    refreshed=False;analysis_refreshed=False
+    for tf in CHART_TIMEFRAMES:
         try:
-            previous=db.candles(INSTRUMENT,tf,1)
+            previous=[row for row in db.candles(INSTRUMENT,tf,5) if row.confirm]
             rows=await client.candles(INSTRUMENT,tf,100,history=False)
-            step=3600_000 if tf=="1H" else 4*3600_000
-            if previous and rows and min(row.timestamp for row in rows)>previous[-1].timestamp+step:
+            received_confirmed=[row for row in rows if row.confirm]
+            step=int(CANDLE_TIMEFRAMES[tf]["durationMs"])
+            if previous and received_confirmed and min(row.timestamp for row in received_confirmed)>previous[-1].timestamp+step:
+                _remember_candle_gap(tf,previous[-1].timestamp,min(row.timestamp for row in received_confirmed))
                 rows=await client.candles(INSTRUMENT,tf,300,history=True)
-            if rows:db.upsert_candles(INSTRUMENT,rows);refreshed=True
-        except Exception:pass
-    if refreshed:
+            retention=CANDLE_TIMEFRAMES[tf].get("retentionMs")
+            if rows:
+                db.upsert_candles(INSTRUMENT,rows,int(time.time()*1000)-int(retention) if retention else None)
+                gap_detected=_refresh_candle_gap_status(tf,rows);refreshed=True
+                await broadcast({
+                    "type":"candle","timeframe":tf,
+                    "candles":[row.model_dump(by_alias=True,mode="json") for row in rows],
+                    "gapDetected":gap_detected,
+                })
+                if tf in ANALYSIS_TIMEFRAMES:analysis_refreshed=True
+        except Exception:runtime["candle_gaps"][tf]=True
+    if analysis_refreshed:
         try:await publish_current_signal()
         except Exception:pass
     return refreshed
@@ -408,6 +627,27 @@ async def market_reconcile_loop():
     while True:
         await asyncio.sleep(300)
         await reconcile_market_once()
+
+
+async def refresh_public_risk_parameters()->bool:
+    """Atomically cache only validated public cross-margin contract data."""
+    try:
+        metadata,tiers=await asyncio.gather(
+            client.instrument_metadata(INSTRUMENT),
+            client.position_tiers("BTC-USDT","cross"),
+        )
+        updated=int(time.time()*1000)
+        db.put_public_market_cache(PUBLIC_RISK_CACHE_KEY,{**metadata,"tiers":tiers,"updatedAt":updated},updated)
+        return True
+    except Exception:
+        return False
+
+
+async def public_risk_parameter_loop():
+    while True:
+        if await refresh_public_risk_parameters():
+            await broadcast({"type":"riskParameters","updatedAt":now_ms()})
+        await asyncio.sleep(PUBLIC_RISK_REFRESH_MS/1000)
 
 
 async def news_loop():
@@ -439,10 +679,11 @@ async def lifespan(app:FastAPI):
     if os.getenv("OKX_DISABLE_NETWORK")!="1":
         runtime["bootstrap_task"]=asyncio.create_task(bootstrap())
         runtime["reconcile_task"]=asyncio.create_task(market_reconcile_loop())
+        runtime["risk_parameter_task"]=asyncio.create_task(public_risk_parameter_loop())
         runtime["news_task"]=asyncio.create_task(news_loop())
     yield
     if runtime["stop"]:runtime["stop"].set()
-    tasks=[x for x in (runtime["task"],runtime["bootstrap_task"],runtime["resync_task"],runtime["reconcile_task"],runtime["news_task"],*runtime["backtest_tasks"]) if x]
+    tasks=[x for x in (runtime["task"],runtime["bootstrap_task"],runtime["resync_task"],runtime["reconcile_task"],runtime["intraday_backfill_task"],runtime["risk_parameter_task"],runtime["news_task"],*runtime["backtest_tasks"]) if x]
     for task in tasks:task.cancel()
     if tasks:await asyncio.gather(*tasks,return_exceptions=True)
     if backtest_executor is not None:
@@ -553,6 +794,7 @@ def health():return {"status":"ok","appId":APP_ID,"version":APP_VERSION,"instrum
 
 @app.get("/api/market/snapshot",response_model=MarketSnapshot,response_model_by_alias=True)
 def snapshot():
+    c1m=db.candles(INSTRUMENT,"1m",720);c15m=db.candles(INSTRUMENT,"15m",672)
     c1=db.candles(INSTRUMENT,"1H",200);c4=db.candles(INSTRUMENT,"4H",200);f=db.latest_funding(INSTRUMENT);oi=db.latest_oi(INSTRUMENT)
     now=int(time.time()*1000)
     latest_confirmed=next((candle for candle in reversed(c1) if candle.confirm),None)
@@ -564,7 +806,25 @@ def snapshot():
     # open interest already has its own explicit timestamp in the response.
     market_ts=max([x for x in (runtime["ticker_ts"],last_close) if x is not None],default=0)
     updated=time.strftime("%Y-%m-%dT%H:%M:%SZ",time.gmtime(market_ts/1000)) if market_ts else ""
-    return MarketSnapshot(instrument=INSTRUMENT,price=runtime["price"] or (c1[-1].close if c1 else None),updated_at=updated,stale=stale,candles_1h=c1,candles_4h=c4,funding_rate=f[1] if f else None,funding_time=f[0] if f else None,open_interest=oi[1] if oi else None,open_interest_time=oi[0] if oi else None,connection_status=runtime["connection"])
+    series={"1m":c1m,"15m":c15m,"1H":c1,"4H":c4}
+    candle_status={}
+    for timeframe,rows in series.items():
+        duration=int(CANDLE_TIMEFRAMES[timeframe]["durationMs"])
+        last_at=rows[-1].timestamp if rows else None
+        candle_status[timeframe]={
+            "available":bool(rows),
+            "stale":not last_at or now-(last_at+duration)>2*duration,
+            "lastAt":last_at,
+            "gapDetected":bool(runtime.get("candle_gaps",{}).get(timeframe)),
+        }
+    return MarketSnapshot(
+        instrument=INSTRUMENT,price=runtime["price"] or (c1[-1].close if c1 else None),updated_at=updated,
+        stale=stale,candles_1m=c1m,candles_15m=c15m,candles_1h=c1,candles_4h=c4,
+        mark_price=runtime.get("mark_price"),mark_price_time=runtime.get("mark_price_ts"),candle_status=candle_status,
+        funding_rate=f[1] if f else None,funding_time=f[0] if f else None,
+        open_interest=oi[1] if oi else None,open_interest_time=oi[0] if oi else None,
+        connection_status=runtime["connection"],
+    )
 
 
 @app.get("/api/advice/current")
@@ -597,7 +857,7 @@ def settings_put(value:Settings):db.put_settings(value);return value
 
 @app.post("/api/workbench/calculate")
 def workbench_calculate(value:TradePlanDraft):
-    return calculate_risk(value).model_dump(by_alias=True,mode="json")
+    return _risk_with_liquidation(value,calculate_risk(value))
 
 
 @app.get("/api/trade-plans/current")
@@ -607,6 +867,7 @@ def trade_plan_current():
         if value:
             value=normalize_live_execution_state(value)
             value=recompute_execution(value)
+            value=_enrich_record_liquidation(value)
             db.save_trade_plan(value,active=True)
             return value
     return {"id":None,"state":TradeState.IDLE.value,"plan":None,"risk":None,"events":[]}
@@ -618,7 +879,7 @@ def trade_plan_create(value:TradePlanDraft):
         existing=db.get_active_trade_plan()
         if existing and TradeState(existing["state"]) not in TERMINAL_STATES:
             raise HTTPException(409,"已有未结束的交易计划，请先完成或取消")
-        try:record=make_plan_record(value)
+        try:record=_enrich_record_liquidation(make_plan_record(value))
         except ValueError as exc:raise HTTPException(422,str(exc)) from exc
         db.save_trade_plan(record,active=True)
         db.save_trade_plan_event(record["id"],TradeState.IDLE.value,TradeState.PLANNED.value,"CREATE_PLAN",None,{"risk":record["risk"]})
@@ -634,9 +895,9 @@ def trade_plan_update(plan_id:str,value:TradePlanDraft):
             raise HTTPException(409,"只有尚未确认初始开仓的计划可以修改价格和仓位")
         risk=calculate_risk(value)
         if not risk.valid:raise HTTPException(422,"；".join(risk.errors))
-        updated={**record,"plan":value.model_dump(by_alias=True,mode="json"),"risk":risk.model_dump(by_alias=True,mode="json"),"updatedAt":now_ms()}
+        updated={**record,"plan":value.model_dump(by_alias=True,mode="json"),"risk":_risk_with_liquidation(value,risk),"updatedAt":now_ms()}
         updated.pop("activeReminder",None)
-        updated=recompute_execution(updated)
+        updated=_enrich_record_liquidation(recompute_execution(updated))
         db.save_trade_plan(updated,active=True)
         db.save_trade_plan_event(plan_id,record["state"],record["state"],"UPDATE_PLAN",None,{"risk":updated["risk"]})
         return updated
@@ -651,6 +912,7 @@ def trade_plan_action(plan_id:str,value:TradeActionRequest):
         before=record["state"]
         try:updated,target=apply_action(record,value)
         except ValueError as exc:raise HTTPException(409,str(exc)) from exc
+        updated=_enrich_record_liquidation(updated)
         db.save_trade_plan(updated,active=True)
         db.save_trade_plan_event(plan_id,before,target,value.action.value,value.price,{"note":value.note,"quantityBtc":value.quantity_btc})
         log=_save_terminal_trade_log(updated,"live")
@@ -685,7 +947,45 @@ def trade_log_history(source:str=Query("live",pattern="^(live|replay)$"),limit:i
 
 @app.get("/api/trade-logs/statistics")
 def trade_log_statistics(source:str=Query("live",pattern="^(live|replay)$")):
-    return trade_statistics(db.trade_logs(source,1000))
+    return trade_statistics(db.trade_logs(source,None))
+
+
+@app.get("/api/trade-logs/export")
+def trade_log_export(
+    source:str=Query(...,pattern="^(live|replay)$"),
+    format:str=Query(...,pattern="^(csv|json)$"),
+):
+    rows=db.trade_logs(source,None);exported=now_ms()
+    if format=="csv":
+        content=encode_trade_log_csv(rows);media_type="text/csv; charset=utf-8";extension="csv"
+    else:
+        content=encode_trade_log_json(source,rows,exported);media_type="application/json";extension="json"
+    return Response(
+        content=content,media_type=media_type,
+        headers={"Content-Disposition":f'attachment; filename="trade-logs-{source}-{exported}.{extension}"'},
+    )
+
+
+@app.delete("/api/trade-logs/{log_id}")
+def trade_log_delete(log_id:str,source:str=Query(...,pattern="^(live|replay)$")):
+    if not log_id or len(log_id)>200:raise HTTPException(422,"invalid trade log id")
+    deleted=db.delete_trade_log(source,log_id)
+    return {"deleted":deleted,"deletedCount":1 if deleted else 0,"source":source,"id":log_id}
+
+
+@app.post("/api/trade-logs/bulk-delete")
+def trade_log_bulk_delete(value:BulkDeleteTradeLogsRequest):
+    deleted=db.bulk_delete_trade_logs(value.source,value.ids)
+    return {"deletedCount":len(deleted),"source":value.source}
+
+
+@app.delete("/api/trade-logs")
+def trade_log_clear(
+    source:str=Query(...,pattern="^(live|replay)$"),
+    confirmation:str=Query(...),
+):
+    if confirmation!="DELETE":raise HTTPException(422,"confirmation must equal DELETE")
+    return {"deletedCount":db.clear_trade_logs(source),"source":source}
 
 
 def _replay_data(record:dict)->dict:
@@ -788,6 +1088,10 @@ async def clear_data():
         raise HTTPException(409,"回测运行期间不能清除本地数据")
     db.clear_local_data()
     runtime["price"],runtime["ticker_ts"]=None,None
+    runtime["mark_price"],runtime["mark_price_ts"]=None,None
+    runtime["liquidation_refresh_ts"]=0
+    runtime["candle_gaps"]={timeframe:False for timeframe in CHART_TIMEFRAMES}
+    runtime["candle_gap_targets"]={timeframe:None for timeframe in CHART_TIMEFRAMES}
     runtime["news"],runtime["news_source_status"]=_empty_news("本地数据已清除，等待重新同步"),[]
     runtime["news_checked"],runtime["news_last_success"]=False,None
     resyncing=False

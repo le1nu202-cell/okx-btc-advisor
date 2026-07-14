@@ -1,0 +1,64 @@
+.v05-critical-warning {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  margin-top: 10px;
+  padding: 12px 14px;
+  border: 1px solid #a94057;
+  border-radius: 10px;
+  background: #36151e;
+  color: #ffafbd;
+  font-weight: 800;
+}
+
+.v05-estimate-disclaimer {
+  margin: 8px 2px 0;
+  color: #9aa7a3;
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.v05-critical-warning svg {
+  width: 19px;
+  flex: none;
+}
+
+.v05-risk-explanation p {
+  margin: 10px 0 0;
+}
+
+.v05-risk-tier-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 7px;
+}
+
+.v05-risk-tier-grid > div {
+  padding: 9px 10px;
+  border: 1px solid #574926;
+  border-radius: 8px;
+  background: #17150f;
+}
+
+.v05-risk-tier-grid strong,
+.v05-risk-tier-grid span {
+  display: block;
+}
+
+.v05-risk-tier-grid strong {
+  color: #f1cd83;
+  font-size: 12px;
+}
+
+.v05-risk-tier-grid span {
+  margin-top: 4px;
+  color: #bcae91;
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+@media (max-width: 460px) {
+  .v05-risk-tier-grid {
+    grid-template-columns: 1fr;
+  }
+}

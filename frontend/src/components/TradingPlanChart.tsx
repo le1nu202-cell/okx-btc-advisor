@@ -8,15 +8,18 @@ import {
   createSeriesMarkers,
 } from 'lightweight-charts'
 import type { AutoscaleInfoProvider, IChartApi, IPriceLine, ISeriesApi, ISeriesMarkersPluginApi, Time } from 'lightweight-charts'
-import { buildActualFillMarkers, buildPlanPriceLines, toChartCandles } from '../chart-adapter'
+import { buildActualFillMarkers, buildPlanPriceLines, CHART_TIMEFRAMES, toChartCandles } from '../chart-adapter'
 import type { ChartTimeframe } from '../chart-adapter'
-import type { Candle } from '../types'
+import type { Candle, CandleTimeframeStatus } from '../types'
 import type { ActualFill, ActualFillKey, ExecutionRisk, RiskCalculation, TradePlanDraft } from '../workbench-types'
 
 export interface TradingPlanChartProps {
+  candles1m?: Candle[]
+  candles15m?: Candle[]
   candles1h: Candle[]
   candles4h: Candle[]
   timeframe: ChartTimeframe
+  onTimeframeChange?: (timeframe: ChartTimeframe) => void
   currentPrice: number | null
   plan: TradePlanDraft
   plannedRisk: RiskCalculation | null
@@ -24,14 +27,18 @@ export interface TradingPlanChartProps {
   actualFills: Partial<Record<ActualFillKey, ActualFill>>
   stale: boolean
   connectionStatus: string
+  candleStatus?: Partial<Record<ChartTimeframe, CandleTimeframeStatus>>
 }
 
-const CHART_HEIGHT = 430
+const CHART_HEIGHT = 470
 
 export default function TradingPlanChart({
+  candles1m = [],
+  candles15m = [],
   candles1h,
   candles4h,
   timeframe,
+  onTimeframeChange,
   currentPrice,
   plan,
   plannedRisk,
@@ -39,23 +46,34 @@ export default function TradingPlanChart({
   actualFills,
   stale,
   connectionStatus,
+  candleStatus,
 }: TradingPlanChartProps) {
   const containerRef = useRef<HTMLDivElement | null>(null)
   const chartRef = useRef<IChartApi | null>(null)
   const seriesRef = useRef<ISeriesApi<'Candlestick'> | null>(null)
   const markersRef = useRef<ISeriesMarkersPluginApi<Time> | null>(null)
-  const planLinesRef = useRef<IPriceLine[]>([])
+  const priceLinesRef = useRef<IPriceLine[]>([])
   const currentPriceLineRef = useRef<IPriceLine | null>(null)
-  const fittedTimeframeRef = useRef<ChartTimeframe | null>(null)
+  const fittedTimeframesRef = useRef<Set<ChartTimeframe>>(new Set())
   const [selectedTimeframe, setSelectedTimeframe] = useState<ChartTimeframe>(timeframe)
+  const [showPlanned, setShowPlanned] = useState(true)
+  const [showActual, setShowActual] = useState(true)
+  const [showFills, setShowFills] = useState(true)
 
   useEffect(() => setSelectedTimeframe(timeframe), [timeframe])
 
-  const selectedCandles = selectedTimeframe === '1H' ? candles1h : candles4h
-  const chartCandles = useMemo(() => toChartCandles(selectedCandles), [selectedCandles])
-  const priceLineDefinitions = useMemo(
-    () => buildPlanPriceLines(plan, plannedRisk, executionRisk),
-    [plan, plannedRisk, executionRisk],
+  const candlesByTimeframe = useMemo<Record<ChartTimeframe, Candle[]>>(() => ({
+    '1m': candles1m,
+    '15m': candles15m,
+    '1H': candles1h,
+    '4H': candles4h,
+  }), [candles1m, candles15m, candles1h, candles4h])
+  const chartCandles = useMemo(() => toChartCandles(candlesByTimeframe[selectedTimeframe]), [candlesByTimeframe, selectedTimeframe])
+  const closedMarkerCandles = useMemo(() => toChartCandles(candlesByTimeframe[selectedTimeframe].filter(candle => candle.confirm === true)), [candlesByTimeframe, selectedTimeframe])
+  const allPriceLines = useMemo(() => buildPlanPriceLines(plan, plannedRisk, executionRisk), [plan, plannedRisk, executionRisk])
+  const visiblePriceLines = useMemo(
+    () => allPriceLines.filter(line => line.group === 'planned' ? showPlanned : showActual),
+    [allPriceLines, showActual, showPlanned],
   )
 
   useEffect(() => {
@@ -66,31 +84,18 @@ export default function TradingPlanChart({
     const chart = createChart(container, {
       width: initialWidth,
       height: initialHeight,
-      layout: {
-        background: { type: ColorType.Solid, color: '#090e13' },
-        textColor: '#87948f',
-        attributionLogo: true,
-      },
-      grid: {
-        vertLines: { color: '#172129' },
-        horzLines: { color: '#172129' },
-      },
+      layout: { background: { type: ColorType.Solid, color: '#090e13' }, textColor: '#8d9996', attributionLogo: true },
+      grid: { vertLines: { color: '#172129' }, horzLines: { color: '#172129' } },
       crosshair: { mode: CrosshairMode.Normal },
       rightPriceScale: { borderColor: '#26313a', scaleMargins: { top: 0.08, bottom: 0.08 } },
-      timeScale: { borderColor: '#26313a', timeVisible: true, secondsVisible: false, rightOffset: 5 },
+      timeScale: { borderColor: '#26313a', timeVisible: true, secondsVisible: selectedTimeframe === '1m', rightOffset: 5 },
       handleScroll: { mouseWheel: true, pressedMouseMove: true, horzTouchDrag: true, vertTouchDrag: false },
       handleScale: { axisPressedMouseMove: true, mouseWheel: true, pinch: true },
       localization: { locale: 'zh-CN' },
     })
     const series = chart.addSeries(CandlestickSeries, {
-      upColor: '#49e7ac',
-      downColor: '#ff627d',
-      borderUpColor: '#49e7ac',
-      borderDownColor: '#ff627d',
-      wickUpColor: '#49e7ac',
-      wickDownColor: '#ff627d',
-      priceLineVisible: false,
-      lastValueVisible: false,
+      upColor: '#49e7ac', downColor: '#ff627d', borderUpColor: '#49e7ac', borderDownColor: '#ff627d',
+      wickUpColor: '#49e7ac', wickDownColor: '#ff627d', priceLineVisible: false, lastValueVisible: false,
     })
     const markers = createSeriesMarkers(series, [])
     chartRef.current = chart
@@ -106,16 +111,14 @@ export default function TradingPlanChart({
     if (typeof ResizeObserver !== 'undefined') {
       resizeObserver = new ResizeObserver(entries => resize(entries[0]?.contentRect.width, entries[0]?.contentRect.height))
       resizeObserver.observe(container)
-    } else {
-      window.addEventListener('resize', onWindowResize)
-    }
+    } else window.addEventListener('resize', onWindowResize)
 
     return () => {
       resizeObserver?.disconnect()
       window.removeEventListener('resize', onWindowResize)
-      planLinesRef.current = []
+      priceLinesRef.current = []
       currentPriceLineRef.current = null
-      fittedTimeframeRef.current = null
+      fittedTimeframesRef.current.clear()
       markersRef.current = null
       seriesRef.current = null
       chartRef.current = null
@@ -124,42 +127,38 @@ export default function TradingPlanChart({
   }, [])
 
   useEffect(() => {
+    chartRef.current?.applyOptions({ timeScale: { secondsVisible: selectedTimeframe === '1m' } })
+  }, [selectedTimeframe])
+
+  useEffect(() => {
     const series = seriesRef.current
     const chart = chartRef.current
     if (!series || !chart) return
     series.setData(chartCandles)
-    if (chartCandles.length && fittedTimeframeRef.current !== selectedTimeframe) {
+    if (chartCandles.length && !fittedTimeframesRef.current.has(selectedTimeframe)) {
       chart.timeScale().fitContent()
-      fittedTimeframeRef.current = selectedTimeframe
+      fittedTimeframesRef.current.add(selectedTimeframe)
     }
   }, [chartCandles, selectedTimeframe])
 
   useEffect(() => {
-    const markerApi = markersRef.current
-    if (!markerApi) return
-    markerApi.setMarkers(buildActualFillMarkers(actualFills, chartCandles, plan.direction))
-  }, [actualFills, chartCandles, plan.direction])
+    markersRef.current?.setMarkers(showFills ? buildActualFillMarkers(actualFills, closedMarkerCandles, plan.direction) : [])
+  }, [actualFills, closedMarkerCandles, plan.direction, showFills])
 
   useEffect(() => {
     const series = seriesRef.current
     if (!series) return
-    for (const line of planLinesRef.current) series.removePriceLine(line)
-    planLinesRef.current = priceLineDefinitions.map(line => series.createPriceLine({
-      id: line.id,
-      price: line.price,
-      title: line.title,
-      color: line.color,
-      lineStyle: line.lineStyle,
-      lineWidth: 1,
-      lineVisible: true,
-      axisLabelVisible: true,
+    for (const line of priceLinesRef.current) series.removePriceLine(line)
+    priceLinesRef.current = visiblePriceLines.map(line => series.createPriceLine({
+      id: line.id, price: line.price, title: line.title, color: line.color, lineStyle: line.lineStyle,
+      lineWidth: 1, lineVisible: true, axisLabelVisible: true,
     }))
-  }, [priceLineDefinitions])
+  }, [visiblePriceLines])
 
   useEffect(() => {
     const series = seriesRef.current
     if (!series) return
-    const visualPrices = priceLineDefinitions.map(line => line.price)
+    const visualPrices = visiblePriceLines.map(line => line.price)
     if (currentPrice != null && Number.isFinite(currentPrice) && currentPrice > 0) visualPrices.push(currentPrice)
     const autoscaleInfoProvider: AutoscaleInfoProvider = original => {
       const base = original()
@@ -167,18 +166,10 @@ export default function TradingPlanChart({
       const visualMin = Math.min(...visualPrices)
       const visualMax = Math.max(...visualPrices)
       if (!base?.priceRange) return { priceRange: { minValue: visualMin, maxValue: visualMax } }
-      return {
-        ...base,
-        priceRange: {
-          minValue: Math.min(base.priceRange.minValue, visualMin),
-          maxValue: Math.max(base.priceRange.maxValue, visualMax),
-        },
-      }
+      return { ...base, priceRange: { minValue: Math.min(base.priceRange.minValue, visualMin), maxValue: Math.max(base.priceRange.maxValue, visualMax) } }
     }
-    series.applyOptions({
-      autoscaleInfoProvider,
-    })
-  }, [priceLineDefinitions, currentPrice])
+    series.applyOptions({ autoscaleInfoProvider })
+  }, [visiblePriceLines, currentPrice])
 
   useEffect(() => {
     const series = seriesRef.current
@@ -193,32 +184,42 @@ export default function TradingPlanChart({
       return
     }
     currentPriceLineRef.current = series.createPriceLine({
-      id: 'current-market-price',
-      price: currentPrice,
-      title: '当前价',
-      color: '#e8eef2',
-      lineStyle: LineStyle.Dotted,
-      lineWidth: 1,
-      lineVisible: true,
-      axisLabelVisible: true,
+      id: 'current-market-price', price: currentPrice, title: '当前价格', color: '#eef3f6',
+      lineStyle: LineStyle.Dotted, lineWidth: 1, lineVisible: true, axisLabelVisible: true,
     })
   }, [currentPrice])
 
+  const selectTimeframe = (value: ChartTimeframe) => {
+    setSelectedTimeframe(value)
+    onTimeframeChange?.(value)
+  }
+  const selectedStatus = candleStatus?.[selectedTimeframe]
   const disconnected = connectionStatus !== 'connected'
+  const unavailable = selectedStatus?.available === false || !chartCandles.length
+  const dataWarning = unavailable
+    ? `${selectedTimeframe} 暂无可用 K 线`
+    : selectedStatus?.gapDetected
+      ? `${selectedTimeframe} 检测到行情缺口，请谨慎参考`
+      : stale || selectedStatus?.stale
+        ? `${selectedTimeframe} 行情已过期，请勿据此确认成交`
+        : disconnected ? `公共行情连接状态：${connectionStatus}` : ''
+
   return <div className="wb-chart-wrap" data-testid="trading-plan-chart">
     <div className="wb-chart-toolbar">
       <div className="wb-timeframe-tabs" role="tablist" aria-label="K 线周期">
-        {(['1H', '4H'] as const).map(value => <button key={value} type="button" role="tab" aria-selected={selectedTimeframe === value} className={selectedTimeframe === value ? 'active' : ''} onClick={() => setSelectedTimeframe(value)}>{value}</button>)}
+        {CHART_TIMEFRAMES.map(value => <button key={value} type="button" role="tab" aria-selected={selectedTimeframe === value} className={selectedTimeframe === value ? 'active' : ''} onClick={() => selectTimeframe(value)}>{value}</button>)}
       </div>
-      <span>{selectedTimeframe} 已收盘 K 线 · 可滚轮缩放、拖拽平移与十字光标查看</span>
+      <div className="wb-chart-switches" aria-label="图表显示开关">
+        <button type="button" aria-pressed={showPlanned} className={showPlanned ? 'active planned' : ''} onClick={() => setShowPlanned(value => !value)}>计划线</button>
+        <button type="button" aria-pressed={showActual} className={showActual ? 'active actual' : ''} onClick={() => setShowActual(value => !value)}>实际线</button>
+        <button type="button" aria-pressed={showFills} className={showFills ? 'active fills' : ''} onClick={() => setShowFills(value => !value)}>成交标记</button>
+      </div>
     </div>
-    <div className="wb-lightweight-chart" ref={containerRef} aria-label={`${selectedTimeframe} 蜡烛图与六条计划风险价格线`}/>
-    {(stale || disconnected || !chartCandles.length) && <div className="wb-chart-status" role="status">
-      {!chartCandles.length ? '当前周期暂无可用 K 线。' : stale ? '行情数据已过期，价格线保留但请勿据此确认成交。' : `公共行情连接状态：${connectionStatus}`}
-    </div>}
+    <div className="wb-lightweight-chart" ref={containerRef} aria-label={`${selectedTimeframe} 蜡烛图、计划与实际价格线`}/>
+    {dataWarning && <div className="wb-chart-status" role="status">{dataWarning}</div>}
     <div className="wb-chart-caption">
-      <span>成交标记仅来自 actualFills；行情提醒不会生成标记。</span>
-      <span>价格线由表单与后端权威风险字段同步，本版不支持拖动。</span>
+      <span>滚轮缩放、拖拽平移、十字光标查看；同周期实时更新不会重置视图。</span>
+      <span>计划线来自表单和后端计划风险；实际线与成交标记只来自后端实际成交字段。</span>
       <a href="https://www.tradingview.com/" target="_blank" rel="noreferrer">Charts by TradingView</a>
     </div>
   </div>

@@ -17,6 +17,15 @@ export interface TradePlanDraft {
   initialMargin: number | null
   initialMarginPercent: number
   addMultiplier: number
+  crossAvailableEquity: number
+  extraMarginUsdt: number
+  maintenanceMarginSource: 'AUTO' | 'MANUAL'
+  maintenanceMarginRate: number | null
+  maintenanceMarginFixedUsdt: number
+  liquidationFeeBps: number
+  includeUnsettledFunding: boolean
+  unsettledFundingUsdt: number
+  assumeNoOtherPositions: boolean
   makerFeeBps: number
   takerFeeBps: number
   slippageBps: number
@@ -33,6 +42,41 @@ export interface TradePlanDraft {
 }
 
 export interface AdverseMoveLoss { movePercent: number; lossUsdt: number; equityPercent: number }
+
+export type LiquidationStatus = 'AVAILABLE' | 'UNAVAILABLE' | 'NO_OPEN_POSITION'
+export type HardStopSequence = 'STOP_FIRST' | 'LIQUIDATION_FIRST' | 'OVERLAP_UNSAFE' | 'UNAVAILABLE'
+export interface LiquidationEstimate {
+  status: LiquidationStatus
+  estimatedLiquidationPrice: number | null
+  referenceMarkPrice: number | null
+  referenceMarkTime: number | null
+  referenceMarkStatus: 'AVAILABLE' | 'MISSING' | 'STALE'
+  distanceStatus: 'AVAILABLE' | 'UNAVAILABLE'
+  distancePercent: number | null
+  distanceRisk: string
+  hardStopSequence: HardStopSequence
+  hardStopBufferPercent: number | null
+  quantityBtc: number | null
+  averageEntryPrice: number | null
+  supportingEquityUsdt: number | null
+  maintenanceMarginRate: number | null
+  maintenanceMarginFixedUsdt: number | null
+  liquidationFeeRate: number | null
+  tier: number | string | null
+  contracts: number | null
+  parameterSource: 'OKX_PUBLIC' | 'MANUAL' | 'UNAVAILABLE'
+  parametersUpdatedAt: number | null
+  changeFromPreviousUsdt?: number | null
+  assumptions: string[]
+  warnings: string[]
+  errors: string[]
+}
+
+export interface LiquidationScenarios {
+  initialOnly: LiquidationEstimate | null
+  afterAdd: LiquidationEstimate | null
+  afterPlannedReduce: LiquidationEstimate | null
+}
 
 export interface RiskCalculation {
   valid: boolean
@@ -84,6 +128,7 @@ export interface RiskCalculation {
   riskLevel: string
   lossLimitExceeded: boolean
   liquidationWarning: boolean
+  liquidationScenarios?: LiquidationScenarios | null
   assumptions: string[]
 }
 
@@ -104,6 +149,7 @@ export interface ExecutionSummary {
   allocatedEntryFees: number
   exitFees: number
   fees: number
+  incurredFees?: number
   slippageUsdt: number
   realizedNetPnl: number
   mfeMaeSupported: boolean
@@ -118,7 +164,9 @@ export interface ExecutionRisk {
   remainingNetLossAtStop?: number | null
   netLossAtStop: number | null
   maxLossEquityPercent: number | null
+  riskLevel?: string
   totalNetPnlIfStopped: number | null
+  liquidationEstimate?: LiquidationEstimate | null
 }
 
 export interface RealizedSegment {
@@ -186,17 +234,27 @@ export interface TradeLog {
   source: 'live' | 'replay'
   direction: TradeDirection
   state: TradeState
-  planPrices: Record<string, number>
+  planPrices: Record<string, number | null>
   actualPrices: Record<string, number | null>
+  actualQuantitiesBtc?: Record<string, number | null>
   initialQuantityBtc: number
   addQuantityBtc: number
   totalQuantityBtc: number
   initialMargin: number
   addMargin: number
   leverage: number
+  makerFeeBps?: number
+  takerFeeBps?: number
+  slippageBps?: number
   fees: number
   grossPnl: number
+  slippageUsdt?: number
   netPnl: number
+  accountReturnPercent?: number | null
+  returnPercent?: number | null
+  execution?: ExecutionSummary | null
+  executionRisk?: ExecutionRisk | null
+  realizedSegments?: RealizedSegment[]
   mfeUsdt: number | null
   maeUsdt: number | null
   regime4H: string
@@ -207,8 +265,18 @@ export interface TradeLog {
   closedAt: number
 }
 
+export interface TradeEquityPoint {
+  timestamp: number
+  cumulativeNetPnl: number
+  equity: number | null
+}
+
 export interface TradeStats {
   totalTrades: number
+  winningTrades?: number
+  losingTrades?: number
+  breakevenTrades?: number
+  winRate?: number | null
   initialDirectTakeProfitRate: number | null
   addTriggerRate: number | null
   returnToReduceZoneRate: number | null
@@ -217,10 +285,17 @@ export interface TradeStats {
   averageLoss: number | null
   profitFactor: number | null
   totalFees: number
+  totalSlippage?: number
   feesToGrossProfit: number | null
   maxConsecutiveLosses: number
   maxDrawdownUsdt: number
   netPnl: number
+  startingEquity?: number | null
+  simulatedEquity?: number | null
+  equityCurve?: TradeEquityPoint[]
+  addTriggeredCount?: number
+  returnedToReduceZoneCount?: number
+  stoppedAfterAddCount?: number
   byDirection: Record<string, { trades: number; netPnl: number; winRate: number | null; averagePnl: number | null }>
   byRegime: Record<string, { trades: number; netPnl: number; winRate: number | null; averagePnl: number | null }>
 }
@@ -249,10 +324,19 @@ export const DEFAULT_PLAN: TradePlanDraft = {
   initialMargin: null,
   initialMarginPercent: 4,
   addMultiplier: 2,
+  crossAvailableEquity: 80,
+  extraMarginUsdt: 0,
+  maintenanceMarginSource: 'AUTO',
+  maintenanceMarginRate: null,
+  maintenanceMarginFixedUsdt: 0,
+  liquidationFeeBps: 5,
+  includeUnsettledFunding: false,
+  unsettledFundingUsdt: 0,
+  assumeNoOtherPositions: true,
   makerFeeBps: 2,
   takerFeeBps: 5,
   slippageBps: 5,
-  marginMode: 'ISOLATED',
+  marginMode: 'CROSS',
   sizingMode: 'MARGIN',
   maxLossUsdt: 3,
   lossLimitUsdt: 3,
@@ -262,4 +346,20 @@ export const DEFAULT_PLAN: TradePlanDraft = {
   approachThresholdPercent: .25,
   notes: '',
   screenshotPath: null,
+}
+
+/**
+ * Hydrate additive v0.5 inputs without changing the economics of a v0.4 plan.
+ * Legacy rows did not persist crossAvailableEquity; liquidation already treats
+ * that as the plan equity, so the editor must use the same value rather than
+ * silently injecting today's 80 USDT new-plan default.
+ */
+export const normalizeTradePlanDraft = (plan: Partial<TradePlanDraft> | null | undefined): TradePlanDraft => {
+  const merged = { ...DEFAULT_PLAN, ...(plan ?? {}) }
+  return {
+    ...merged,
+    crossAvailableEquity: typeof plan?.crossAvailableEquity === 'number'
+      ? plan.crossAvailableEquity
+      : merged.equity,
+  }
 }

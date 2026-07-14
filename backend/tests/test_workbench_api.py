@@ -2,6 +2,7 @@ import os
 import asyncio
 import tempfile
 import threading
+import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 
@@ -55,6 +56,33 @@ def test_workbench_calculate_and_plan_restart_recovery(tmp_path, monkeypatch):
     with TestClient(main.app) as client:
         restored = client.get("/api/trade-plans/current").json()
         assert restored["id"] == plan_id and restored["state"] == "PLANNED"
+
+
+def test_legacy_plan_without_cross_equity_uses_its_own_equity_for_liquidation(tmp_path, monkeypatch):
+    local = Database(tmp_path / "legacy-cross-equity.db")
+    monkeypatch.setattr(main, "db", local)
+    plan = main.TradePlanDraft.model_validate({
+        **BASE_PLAN,
+        "equity": 123,
+        "marginMode": "CROSS",
+        "maintenanceMarginSource": "MANUAL",
+        "maintenanceMarginRate": 0.004,
+    })
+    record = main.make_plan_record(plan)
+    record["plan"].pop("crossAvailableEquity", None)
+    local.save_trade_plan(record, active=True)
+
+    with TestClient(main.app) as client:
+        response = client.get("/api/trade-plans/current")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["plan"].get("crossAvailableEquity") is None
+    estimate = body["risk"]["liquidationScenarios"]["afterAdd"]
+    assert estimate["status"] == "AVAILABLE"
+    expected_support = 123 - body["risk"]["openingFee"] - body["risk"]["addFee"]
+    assert estimate["supportingEquityUsdt"] == pytest.approx(expected_support)
+    assert estimate["supportingEquityUsdt"] > 120  # never the v0.5 new-plan default 80U
 
 
 def test_plan_actions_enforce_single_add_and_create_terminal_log(tmp_path, monkeypatch):
@@ -182,6 +210,75 @@ def test_live_price_stop_only_creates_pending_reminder_and_never_log(tmp_path, m
     assert len(events) == 1
     assert events[0]["eventType"] == "STOP_HIT_PENDING_CONFIRMATION"
     assert events[0]["fromState"] == events[0]["toState"] == "INITIAL_OPEN"
+
+
+@pytest.mark.asyncio
+async def test_mark_price_only_refreshes_backend_plan_and_actual_liquidation_distance_with_throttle(tmp_path, monkeypatch):
+    local = Database(tmp_path / "mark-liquidation-refresh.db")
+    monkeypatch.setattr(main, "db", local)
+    now = int(time.time() * 1000)
+    monkeypatch.setitem(main.runtime, "mark_price", 100.0)
+    monkeypatch.setitem(main.runtime, "mark_price_ts", now)
+    monkeypatch.setitem(main.runtime, "liquidation_refresh_ts", 0)
+
+    draft = main.TradePlanDraft.model_validate({
+        **BASE_PLAN,
+        "marginMode": "CROSS",
+        "crossAvailableEquity": 15,
+        "leverage": 10,
+        "maintenanceMarginSource": "MANUAL",
+        "maintenanceMarginRate": 0.005,
+    })
+    record = main._enrich_record_liquidation(main.make_plan_record(draft), evaluated_at=now)
+    record, _ = main.apply_action(record, main.TradeActionRequest(
+        action="CONFIRM_INITIAL", price=100, quantity_btc=record["risk"]["initialQuantityBtc"],
+    ))
+    record, _ = main.apply_action(record, main.TradeActionRequest(
+        action="CONFIRM_ADD", price=90, quantity_btc=record["risk"]["addQuantityBtc"],
+    ))
+    record = main._enrich_record_liquidation(record, evaluated_at=now)
+    local.save_trade_plan(record, active=True)
+    before_plan = record["risk"]["liquidationScenarios"]["afterAdd"]
+    before_actual = record["executionRisk"]["liquidationEstimate"]
+    assert before_plan["distanceRisk"] == before_actual["distanceRisk"] == "充足"
+
+    frames = []
+
+    async def capture(payload):
+        frames.append(payload)
+
+    monkeypatch.setattr(main, "broadcast", capture)
+    await main.on_okx({
+        "_stream": "public",
+        "arg": {"channel": "mark-price"},
+        "data": [{"markPx": "78", "ts": str(now + 1)}],
+    })
+
+    updates = [frame for frame in frames if frame.get("type") == "tradePlanUpdate"]
+    assert len(updates) == 1 and updates[0]["reason"] == "MARK_PRICE"
+    refreshed = updates[0]["plan"]
+    after_plan = refreshed["risk"]["liquidationScenarios"]["afterAdd"]
+    after_actual = refreshed["executionRisk"]["liquidationEstimate"]
+    assert after_plan["referenceMarkPrice"] == after_actual["referenceMarkPrice"] == 78
+    assert after_plan["distancePercent"] != before_plan["distancePercent"]
+    assert after_actual["distancePercent"] != before_actual["distancePercent"]
+    assert after_plan["distanceRisk"] == after_actual["distanceRisk"] == "危险"
+    assert local.get_active_trade_plan()["executionRisk"]["liquidationEstimate"]["referenceMarkPrice"] == 78
+
+    frames.clear()
+    await main.on_okx({
+        "_stream": "public",
+        "arg": {"channel": "mark-price"},
+        "data": [{"markPx": "77.9", "ts": str(now + 2)}],
+    })
+    assert main.runtime["mark_price"] == 77.9
+    assert not any(frame.get("type") == "tradePlanUpdate" for frame in frames)
+
+    frames.clear()
+    await main.refresh_active_plan_liquidation(
+        reason="MARK_PRICE", evaluated_at=int(main.runtime["liquidation_refresh_ts"]) + 1_000,
+    )
+    assert [frame for frame in frames if frame.get("type") == "tradePlanUpdate"][0]["plan"]["executionRisk"]["liquidationEstimate"]["referenceMarkPrice"] == 77.9
 
 
 def test_planned_update_clears_stale_price_reminder(tmp_path, monkeypatch):

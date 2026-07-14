@@ -13,7 +13,7 @@ from typing import Iterable
 from .models import AdviceAction, Candle, Settings, SignalAdvice
 
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 OI_SAMPLE_BUCKET_MS = 5*60_000
 NEWS_SOURCE_CHECK_RETENTION_MS = 7*86400_000
 
@@ -73,6 +73,11 @@ CREATE TABLE IF NOT EXISTS trade_logs (
  payload TEXT NOT NULL, closed_at INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_trade_logs_closed ON trade_logs(source,closed_at DESC);
+CREATE INDEX IF NOT EXISTS idx_trade_logs_closed_id ON trade_logs(source,closed_at DESC,id DESC);
+CREATE TABLE IF NOT EXISTS public_market_cache (
+ cache_key TEXT PRIMARY KEY, payload TEXT NOT NULL,
+ observed_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
+);
 CREATE TABLE IF NOT EXISTS replay_sessions (
  id TEXT PRIMARY KEY, status TEXT NOT NULL, cursor_ts INTEGER NOT NULL,
  payload TEXT NOT NULL, result TEXT, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
@@ -127,6 +132,7 @@ class Database:
     def connect(self) -> sqlite3.Connection:
         con = sqlite3.connect(self.path, timeout=20, check_same_thread=False)
         con.row_factory = sqlite3.Row
+        con.execute("PRAGMA foreign_keys=ON")
         return con
 
     @contextmanager
@@ -139,7 +145,7 @@ class Database:
         finally:
             con.close()
 
-    def upsert_candles(self, instrument: str, candles: Iterable[Candle]) -> int:
+    def upsert_candles(self, instrument: str, candles: Iterable[Candle], retention_before: int | None = None) -> int:
         rows = [(instrument,c.timeframe,c.timestamp,c.open,c.high,c.low,c.close,c.volume,c.volume_ccy,int(c.confirm)) for c in candles]
         with self._lock, self.session() as con:
             con.executemany(
@@ -155,6 +161,15 @@ class Database:
                 "AND (candles.volume_ccy IS NULL OR excluded.volume_ccy>=candles.volume_ccy))",
                 rows,
             )
+            if retention_before is not None and rows:
+                # 1H/4H are the durable research/replay corpus and must never
+                # be pruned by the chart-only rolling-retention facility.
+                timeframes={row[1] for row in rows if row[1] in {"1m","15m"}}
+                for timeframe in timeframes:
+                    con.execute(
+                        "DELETE FROM candles WHERE instrument=? AND timeframe=? AND ts<?",
+                        (instrument,timeframe,int(retention_before)),
+                    )
         return len(rows)
 
     def candles(self, instrument: str, timeframe: str, limit: int = 500, confirmed_only: bool = False) -> list[Candle]:
@@ -415,7 +430,7 @@ class Database:
             for table in (
                 "candles","funding","open_interest","signals","settings","backtests",
                 "news_items","news_source_checks","trade_plan_events","trade_plans",
-                "trade_logs","replay_sessions",
+                "trade_logs","replay_sessions","public_market_cache",
             ):
                 con.execute(f"DELETE FROM {table}")
 
@@ -485,21 +500,134 @@ class Database:
         if source not in {"live","replay"}:raise ValueError("invalid trade log source")
         closed=int(record.get("closedAt") or time.time()*1000)
         with self._lock,self.session() as con:
+            existing=con.execute("SELECT source FROM trade_logs WHERE id=?",(record["id"],)).fetchone()
+            if existing and existing["source"]!=source:
+                raise ValueError("trade log id already belongs to another source")
             con.execute(
                 "INSERT INTO trade_logs(id,plan_id,source,payload,closed_at) VALUES(?,?,?,?,?) "
                 "ON CONFLICT(id) DO UPDATE SET payload=excluded.payload,closed_at=excluded.closed_at",
                 (record["id"],record.get("planId"),source,_json_dumps(record),closed),
             )
 
-    def trade_logs(self,source:str="live",limit:int=500) -> list[dict]:
+    def trade_logs(self,source:str="live",limit:int|None=500) -> list[dict]:
         if source not in {"live","replay"}:raise ValueError("invalid trade log source")
         with self.session() as con:
-            rows=con.execute("SELECT payload FROM trade_logs WHERE source=? ORDER BY closed_at DESC LIMIT ?",(source,limit)).fetchall()
+            if limit is None:
+                rows=con.execute(
+                    "SELECT payload FROM trade_logs WHERE source=? ORDER BY closed_at DESC,id DESC",
+                    (source,),
+                ).fetchall()
+            else:
+                rows=con.execute(
+                    "SELECT payload FROM trade_logs WHERE source=? ORDER BY closed_at DESC,id DESC LIMIT ?",
+                    (source,int(limit)),
+                ).fetchall()
         result=[]
         for row in rows:
             try:result.append(_json_loads(row["payload"]))
             except (TypeError,ValueError,json.JSONDecodeError):continue
         return result
+
+    def delete_trade_log(self,source:str,log_id:str) -> bool:
+        if source not in {"live","replay"}:raise ValueError("invalid trade log source")
+        with self._lock,self.session() as con:
+            cursor=con.execute("DELETE FROM trade_logs WHERE source=? AND id=?",(source,str(log_id)))
+            if cursor.rowcount>0 and source=="replay":
+                self._delete_replay_sessions_for_log_ids(con,{str(log_id)})
+        return cursor.rowcount>0
+
+    def bulk_delete_trade_logs(self,source:str,ids:Iterable[str]) -> list[str]:
+        if source not in {"live","replay"}:raise ValueError("invalid trade log source")
+        normalized=list(dict.fromkeys(str(item) for item in ids if str(item)))
+        if not normalized:return []
+        if len(normalized)>500:raise ValueError("too many trade log ids")
+        placeholders=",".join("?" for _ in normalized)
+        with self._lock,self.session() as con:
+            rows=con.execute(
+                f"SELECT id FROM trade_logs WHERE source=? AND id IN ({placeholders}) ORDER BY id",
+                (source,*normalized),
+            ).fetchall()
+            deleted=[str(row["id"]) for row in rows]
+            if deleted:
+                delete_placeholders=",".join("?" for _ in deleted)
+                con.execute(
+                    f"DELETE FROM trade_logs WHERE source=? AND id IN ({delete_placeholders})",
+                    (source,*deleted),
+                )
+                if source=="replay":
+                    self._delete_replay_sessions_for_log_ids(con,set(deleted))
+        return deleted
+
+    def clear_trade_logs(self,source:str) -> int:
+        if source not in {"live","replay"}:raise ValueError("invalid trade log source")
+        with self._lock,self.session() as con:
+            replay_log_ids={
+                str(row["id"])
+                for row in con.execute("SELECT id FROM trade_logs WHERE source='replay'").fetchall()
+            } if source=="replay" else set()
+            cursor=con.execute("DELETE FROM trade_logs WHERE source=?",(source,))
+            if replay_log_ids:
+                self._delete_replay_sessions_for_log_ids(con,replay_log_ids)
+        return max(0,cursor.rowcount)
+
+    @staticmethod
+    def _delete_replay_sessions_for_log_ids(con:sqlite3.Connection,log_ids:set[str]) -> int:
+        """Delete Replay sessions that expose a deleted terminal trade log.
+
+        ``replay_sessions`` predates the trade-history API and has no relational
+        foreign key: the reference is stored in its JSON payload/result.  Keep
+        the lookup and deletion on the caller's SQLite connection so deleting a
+        Replay log and its owning session is one atomic transaction.  Incomplete
+        sessions without a matching terminal log are intentionally preserved.
+        """
+        if not log_ids:return 0
+        session_ids=[]
+        rows=con.execute("SELECT id,payload,result FROM replay_sessions").fetchall()
+        for row in rows:
+            references:set[str]=set()
+            try:
+                payload=_json_loads(row["payload"])
+            except (TypeError,ValueError,json.JSONDecodeError):
+                payload=None
+            if isinstance(payload,dict):
+                if payload.get("logId") is not None:
+                    references.add(str(payload["logId"]))
+                embedded=payload.get("result")
+                if isinstance(embedded,dict) and embedded.get("id") is not None:
+                    references.add(str(embedded["id"]))
+            try:
+                result=_json_loads(row["result"]) if row["result"] is not None else None
+            except (TypeError,ValueError,json.JSONDecodeError):
+                result=None
+            if isinstance(result,dict) and result.get("id") is not None:
+                references.add(str(result["id"]))
+            if references.intersection(log_ids):
+                session_ids.append(str(row["id"]))
+        if not session_ids:return 0
+        placeholders=",".join("?" for _ in session_ids)
+        cursor=con.execute(f"DELETE FROM replay_sessions WHERE id IN ({placeholders})",session_ids)
+        return max(0,cursor.rowcount)
+
+    def put_public_market_cache(self,cache_key:str,payload:dict,observed_at:int|None=None) -> None:
+        observed=int(observed_at or time.time()*1000)
+        with self._lock,self.session() as con:
+            con.execute(
+                "INSERT INTO public_market_cache(cache_key,payload,observed_at,updated_at) VALUES(?,?,?,?) "
+                "ON CONFLICT(cache_key) DO UPDATE SET payload=excluded.payload,observed_at=excluded.observed_at,updated_at=excluded.updated_at",
+                (str(cache_key),_json_dumps(payload),observed,observed),
+            )
+
+    def get_public_market_cache(self,cache_key:str) -> dict|None:
+        with self.session() as con:
+            row=con.execute(
+                "SELECT payload,observed_at,updated_at FROM public_market_cache WHERE cache_key=?",
+                (str(cache_key),),
+            ).fetchone()
+        if not row:return None
+        try:payload=_json_loads(row["payload"])
+        except (TypeError,ValueError,json.JSONDecodeError):return None
+        if not isinstance(payload,dict):return None
+        return {**payload,"observedAt":row["observed_at"],"updatedAt":row["updated_at"]}
 
     def save_replay_session(self,record:dict) -> None:
         now=int(record.get("updatedAt") or time.time()*1000)
