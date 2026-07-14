@@ -449,3 +449,76 @@ def test_stale_mark_keeps_estimate_but_withholds_all_mark_relative_distance_fiel
     assert fresh_boundary["referenceMarkStatus"] == "AVAILABLE"
     assert fresh_boundary["distanceStatus"] == "AVAILABLE"
     assert fresh_boundary["distancePercent"] is not None
+
+
+def test_cross_equity_and_liquidation_fee_follow_or_manual_modes_are_authoritative():
+    followed = planned_liquidation_scenarios(
+        _scenario_plan(
+            equity=4,
+            crossEquityMode="FOLLOW_EQUITY",
+            crossAvailableEquity=70,
+            takerFeeBps=7,
+            liquidationFeeMode="FOLLOW_TAKER",
+            liquidationFeeBps=99,
+        ),
+        _scenario_risk(),
+        mark_price=100,
+        mark_price_time=1_800_000_000_000,
+        public_context=_public_context(),
+    )["initialOnly"]
+    assert followed["status"] == "AVAILABLE"
+    assert followed["crossEquityMode"] == "FOLLOW_EQUITY"
+    assert followed["crossEquityBasisUsdt"] == 4
+    assert followed["supportingEquityUsdt"] == pytest.approx(4 - 0.04)
+    assert followed["liquidationFeeMode"] == "FOLLOW_TAKER"
+    assert followed["liquidationFeeRate"] == pytest.approx(0.0007)
+    assert any("不是扣除仓位或挂单占用后的可用保证金" in text for text in followed["assumptions"])
+    assert any("当前仓位未实现盈亏单独计算" in text for text in followed["assumptions"])
+    assert any("没有其他全仓或逐仓仓位" in text for text in followed["assumptions"])
+    assert any("没有待成交挂单占用保证金" in text for text in followed["assumptions"])
+    assert any("没有未知账户级费用或资产折算" in text for text in followed["assumptions"])
+    assert any("实际强平以 OKX 标记价格和账户页面为准" in text for text in followed["assumptions"])
+
+    manual = planned_liquidation_scenarios(
+        _scenario_plan(
+            equity=80,
+            crossEquityMode="MANUAL",
+            crossAvailableEquity=4,
+            takerFeeBps=7,
+            liquidationFeeMode="MANUAL",
+            liquidationFeeBps=11,
+        ),
+        _scenario_risk(),
+        mark_price=100,
+        mark_price_time=1_800_000_000_000,
+        public_context=_public_context(),
+    )["initialOnly"]
+    assert manual["crossEquityMode"] == "MANUAL"
+    assert manual["crossEquityBasisUsdt"] == 4
+    assert manual["supportingEquityUsdt"] == pytest.approx(4 - 0.04)
+    assert manual["liquidationFeeMode"] == "MANUAL"
+    assert manual["liquidationFeeRate"] == pytest.approx(0.0011)
+
+
+def test_legacy_mode_inference_preserves_distinct_values_and_follows_equal_values():
+    distinct = planned_liquidation_scenarios(
+        _scenario_plan(equity=80, crossAvailableEquity=4, takerFeeBps=5, liquidationFeeBps=9),
+        _scenario_risk(),
+        mark_price=100,
+        mark_price_time=1_800_000_000_000,
+        public_context=_public_context(),
+    )["initialOnly"]
+    assert distinct["crossEquityMode"] == "MANUAL"
+    assert distinct["crossEquityBasisUsdt"] == 4
+    assert distinct["liquidationFeeMode"] == "MANUAL"
+    assert distinct["liquidationFeeRate"] == pytest.approx(0.0009)
+
+    equal = planned_liquidation_scenarios(
+        _scenario_plan(equity=4, crossAvailableEquity=4, takerFeeBps=5, liquidationFeeBps=5),
+        _scenario_risk(),
+        mark_price=100,
+        mark_price_time=1_800_000_000_000,
+        public_context=_public_context(),
+    )["initialOnly"]
+    assert equal["crossEquityMode"] == "FOLLOW_EQUITY"
+    assert equal["liquidationFeeMode"] == "FOLLOW_TAKER"

@@ -30,6 +30,7 @@ const percent = (value: number | null | undefined) => value == null || !Number.i
 const time = (value: number | null | undefined) => value ? new Intl.DateTimeFormat('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false }).format(value) : '—'
 const connectionLabel = (value: string) => value === 'connected' ? '已连接' : value === 'reconnecting' || value === 'starting' ? '重连中' : value === 'degraded' ? '部分可用' : '未连接'
 const normalizedPlan = normalizeTradePlanDraft
+const riskMessage = (value: string) => value.replaceAll(['全仓', '可用权益'].join(''), '全仓支持余额基准')
 const liquidationAvailable = (value: LiquidationEstimate | null | undefined): value is LiquidationEstimate & { estimatedLiquidationPrice: number } => value?.status === 'AVAILABLE' && value.estimatedLiquidationPrice != null
 const liquidationDistanceAvailable = (value: LiquidationEstimate | null | undefined): value is LiquidationEstimate & { distancePercent: number } => value?.distanceStatus === 'AVAILABLE' && value.distancePercent != null
 const liquidationPrice = (value: LiquidationEstimate | null | undefined) => liquidationAvailable(value) ? `${money(value.estimatedLiquidationPrice)} USDT` : '不可用'
@@ -57,8 +58,8 @@ function Metric({ label, value, hint, tone }: { label: string; value: string; hi
   return <div className="v05-metric"><span>{label}</span><strong className={tone}>{value}</strong>{hint && <small>{hint}</small>}</div>
 }
 
-function NumberField({ label, value, onChange, step = 'any', min = 0, disabled = false, suffix, required = false }: { label: string; value: number | null; onChange: (value: number | null) => void; step?: string | number; min?: number; disabled?: boolean; suffix?: string; required?: boolean }) {
-  return <label className="v05-field"><span>{label}</span><div><input type="number" min={min} step={step} value={value ?? ''} disabled={disabled} required={required} onChange={event => onChange(toInputNumber(event.target.value))}/>{suffix && <em>{suffix}</em>}</div></label>
+function NumberField({ label, value, onChange, step = 'any', min = 0, disabled = false, readOnly = false, hint, suffix, required = false }: { label: string; value: number | null; onChange: (value: number | null) => void; step?: string | number; min?: number; disabled?: boolean; readOnly?: boolean; hint?: string; suffix?: string; required?: boolean }) {
+  return <label className="v05-field"><span>{label}{hint && <small>{hint}</small>}</span><div><input type="number" min={min} step={step} value={value ?? ''} disabled={disabled} readOnly={readOnly} required={required} onChange={event => onChange(toInputNumber(event.target.value))}/>{suffix && <em>{suffix}</em>}</div></label>
 }
 
 function SwitchField({ label, checked, onChange, disabled = false, hint }: { label: string; checked: boolean; onChange: (value: boolean) => void; disabled?: boolean; hint?: string }) {
@@ -74,6 +75,34 @@ function PlanSimulationPanel({ draft, setDraft, record, risk, saving, onSave }: 
   const editable = !record.id || state === 'PLANNED' || isTerminalState(state)
   const orderError = priceOrderError(draft)
   const set = <K extends keyof TradePlanDraft>(key: K, value: TradePlanDraft[K]) => setDraft({ ...draft, [key]: value })
+  const setEquity = (value: number | null) => {
+    const equity = value ?? 0
+    setDraft({
+      ...draft,
+      equity,
+      crossAvailableEquity: draft.crossEquityMode === 'FOLLOW_EQUITY' ? equity : draft.crossAvailableEquity,
+    })
+  }
+  const setCrossEquityMode = (mode: TradePlanDraft['crossEquityMode']) => setDraft({
+    ...draft,
+    crossEquityMode: mode,
+    crossAvailableEquity: mode === 'FOLLOW_EQUITY' ? draft.equity : draft.crossAvailableEquity,
+  })
+  const setTakerFee = (value: number | null) => {
+    const takerFeeBps = value ?? 0
+    setDraft({
+      ...draft,
+      takerFeeBps,
+      liquidationFeeBps: draft.liquidationFeeMode === 'FOLLOW_TAKER' ? takerFeeBps : draft.liquidationFeeBps,
+    })
+  }
+  const setLiquidationFeeMode = (mode: TradePlanDraft['liquidationFeeMode']) => setDraft({
+    ...draft,
+    liquidationFeeMode: mode,
+    liquidationFeeBps: mode === 'FOLLOW_TAKER' ? draft.takerFeeBps : draft.liquidationFeeBps,
+  })
+  const crossEquityMismatch = draft.crossEquityMode === 'MANUAL' && Math.abs(draft.crossAvailableEquity - draft.equity) > 1e-9
+  const liquidationFeeMismatch = draft.liquidationFeeMode === 'MANUAL' && Math.abs(draft.liquidationFeeBps - draft.takerFeeBps) > 1e-9
   const saveLabel = record.id && state === 'PLANNED' ? '更新当前计划' : isTerminalState(state) ? '创建下一笔计划' : '创建交易计划'
   return <section className="v05-panel v05-plan-panel">
     <PanelTitle kicker="计划模拟" title="四价与仓位计划" badge={<span className="v05-badge planned">计划</span>}/>
@@ -87,7 +116,7 @@ function PlanSimulationPanel({ draft, setDraft, record, risk, saving, onSave }: 
         <NumberField label="止盈价" value={draft.takeProfitPrice} onChange={value => set('takeProfitPrice', value)} disabled={!editable} required suffix="USDT"/>
       </div>
       <div className="v05-plan-sizing">
-        <NumberField label="账户权益" value={draft.equity} onChange={value => set('equity', value ?? 0)} disabled={!editable} required suffix="USDT"/>
+        <NumberField label="账户权益" value={draft.equity} onChange={setEquity} disabled={!editable} required suffix="USDT"/>
         <NumberField label="杠杆" value={draft.leverage} onChange={value => set('leverage', value ?? 0)} disabled={!editable} min={1} step="1" required suffix="x"/>
         <NumberField label="初始保证金比例" value={draft.initialMarginPercent} onChange={value => set('initialMarginPercent', value ?? 0)} disabled={!editable || draft.sizingMode === 'MAX_LOSS'} required suffix="%"/>
         <NumberField label="加仓倍数" value={draft.addMultiplier} onChange={value => set('addMultiplier', value ?? 0)} disabled={!editable} required suffix="倍"/>
@@ -99,21 +128,27 @@ function PlanSimulationPanel({ draft, setDraft, record, risk, saving, onSave }: 
           <label className="v05-field"><span>保证金模式</span><div><select value={draft.marginMode} disabled={!editable} onChange={event => set('marginMode', event.target.value as TradePlanDraft['marginMode'])}><option value="CROSS">全仓 CROSS</option><option value="ISOLATED">逐仓 ISOLATED</option></select></div></label>
           <label className="v05-field"><span>仓位计算方式</span><div><select value={draft.sizingMode} disabled={!editable} onChange={event => set('sizingMode', event.target.value as TradePlanDraft['sizingMode'])}><option value="MARGIN">按初始保证金</option><option value="MAX_LOSS">按最大亏损反推</option></select></div></label>
           <NumberField label="初始保证金金额（可选）" value={draft.initialMargin} onChange={value => set('initialMargin', value)} disabled={!editable || draft.sizingMode === 'MAX_LOSS'} suffix="USDT"/>
-          <NumberField label="全仓可用权益" value={draft.crossAvailableEquity} onChange={value => set('crossAvailableEquity', value ?? 0)} disabled={!editable || draft.marginMode !== 'CROSS'} suffix="USDT"/>
+          <label className="v05-field"><span>全仓支持余额基准模式</span><div><select value={draft.crossEquityMode} disabled={!editable || draft.marginMode !== 'CROSS'} onChange={event => setCrossEquityMode(event.target.value as TradePlanDraft['crossEquityMode'])}><option value="FOLLOW_EQUITY">跟随账户权益 FOLLOW_EQUITY</option><option value="MANUAL">手动输入 MANUAL</option></select></div></label>
+          <NumberField label="全仓支持余额基准" hint={draft.crossEquityMode === 'FOLLOW_EQUITY' ? '跟随账户权益' : '手动估计'} value={draft.crossAvailableEquity} onChange={value => set('crossAvailableEquity', value ?? 0)} disabled={!editable || draft.marginMode !== 'CROSS'} readOnly={draft.crossEquityMode === 'FOLLOW_EQUITY'} suffix="USDT"/>
+          <div className="v05-input-explanation"><strong>“全仓支持余额基准”不是 OKX 页面显示的“可用余额”。</strong><span>这是开仓前用于支撑当前单一全仓仓位的账户余额基准，不是扣除仓位或挂单占用后的可用保证金。当前仓位的未实现盈亏由强平公式单独计算。</span><span>默认跟随账户权益；只有你明确知道需要采用不同基准时才切换为手动。其他仓位、占用保证金的挂单、借币、资金费、已实现盈亏或账户余额变化，都会使实际强平结果不同。</span></div>
+          {draft.crossEquityMode === 'MANUAL' && <div className="v05-input-mismatch" role="status">{crossEquityMismatch ? '手动全仓支持余额基准与账户权益不一致：' : '正在使用手动全仓支持余额基准：'}计算会保留并使用手动值，不会随账户权益自动覆盖。</div>}
           <NumberField label="追加保证金" value={draft.extraMarginUsdt} onChange={value => set('extraMarginUsdt', value ?? 0)} disabled={!editable} suffix="USDT"/>
           <label className="v05-field"><span>维持保证金参数</span><div><select value={draft.maintenanceMarginSource} disabled={!editable} onChange={event => set('maintenanceMarginSource', event.target.value as TradePlanDraft['maintenanceMarginSource'])}><option value="AUTO">OKX 公共参数 AUTO</option><option value="MANUAL">手动输入 MANUAL</option></select></div></label>
           <NumberField label="维持保证金率" value={draft.maintenanceMarginRate} onChange={value => set('maintenanceMarginRate', value)} disabled={!editable || draft.maintenanceMarginSource !== 'MANUAL'} step="0.0001"/>
           <NumberField label="维持保证金固定额" value={draft.maintenanceMarginFixedUsdt} onChange={value => set('maintenanceMarginFixedUsdt', value ?? 0)} disabled={!editable || draft.maintenanceMarginSource !== 'MANUAL'} suffix="USDT"/>
-          <NumberField label="预估强平费率" value={draft.liquidationFeeBps} onChange={value => set('liquidationFeeBps', value ?? 0)} disabled={!editable} suffix="bp"/>
+          <label className="v05-field"><span>强平费率模式</span><div><select value={draft.liquidationFeeMode} disabled={!editable} onChange={event => setLiquidationFeeMode(event.target.value as TradePlanDraft['liquidationFeeMode'])}><option value="FOLLOW_TAKER">跟随 Taker 费率 FOLLOW_TAKER</option><option value="MANUAL">手动输入 MANUAL</option></select></div></label>
+          <NumberField label="估算强平费率" hint={draft.liquidationFeeMode === 'FOLLOW_TAKER' ? '跟随 Taker' : '手动估计'} value={draft.liquidationFeeBps} onChange={value => set('liquidationFeeBps', value ?? 0)} disabled={!editable} readOnly={draft.liquidationFeeMode === 'FOLLOW_TAKER'} suffix="bp"/>
           <NumberField label="Maker 手续费" value={draft.makerFeeBps} onChange={value => set('makerFeeBps', value ?? 0)} disabled={!editable} suffix="bp"/>
-          <NumberField label="Taker 手续费" value={draft.takerFeeBps} onChange={value => set('takerFeeBps', value ?? 0)} disabled={!editable} suffix="bp"/>
+          <NumberField label="Taker 手续费" value={draft.takerFeeBps} onChange={setTakerFee} disabled={!editable} suffix="bp"/>
+          {draft.liquidationFeeMode === 'MANUAL' && <div className="v05-input-mismatch" role="status">{liquidationFeeMismatch ? '手动估算强平费率与 Taker 手续费不一致：' : '正在使用手动估算强平费率：'}计算会保留并使用手动值，不会随 Taker 费率自动覆盖。</div>}
           <NumberField label="预计滑点" value={draft.slippageBps} onChange={value => set('slippageBps', value ?? 0)} disabled={!editable} suffix="bp"/>
           <NumberField label="低风险上限" value={draft.riskLowMaxPercent} onChange={value => set('riskLowMaxPercent', value ?? 0)} disabled={!editable} suffix="%"/>
           <NumberField label="中风险上限" value={draft.riskMediumMaxPercent} onChange={value => set('riskMediumMaxPercent', value ?? 0)} disabled={!editable} suffix="%"/>
           <NumberField label="高风险上限" value={draft.riskHighMaxPercent} onChange={value => set('riskHighMaxPercent', value ?? 0)} disabled={!editable} suffix="%"/>
           <SwitchField label="计入未结资金费" checked={draft.includeUnsettledFunding} onChange={value => set('includeUnsettledFunding', value)} disabled={!editable}/>
           <NumberField label="未结资金费" value={draft.unsettledFundingUsdt} onChange={value => set('unsettledFundingUsdt', value ?? 0)} disabled={!editable || !draft.includeUnsettledFunding} suffix="USDT"/>
-          <SwitchField label="假设没有其他持仓" checked={draft.assumeNoOtherPositions} onChange={value => set('assumeNoOtherPositions', value)} disabled={!editable} hint="全仓估算的重要前提"/>
+          <SwitchField label="确认无其他仓位及占用保证金挂单" checked={draft.assumeNoOtherPositions} onChange={value => set('assumeNoOtherPositions', value)} disabled={!editable} hint="全仓估算的重要前提；不满足时不应输出强平价"/>
+          <div className="v05-liquidation-assumptions"><strong>强平估算假设</strong><span>只存在 BTC-USDT-SWAP 这一项全仓仓位；没有其他全仓或逐仓仓位影响账户权益；没有待成交挂单占用保证金；没有未知账户级费用或资产折算；未结资金费仅在你主动勾选并填写后计入。实际强平以 OKX 标记价格和账户页面为准。本工具没有读取账户来核实这些条件。</span></div>
           <label className="v05-field v05-notes"><span>备注（可选）</span><textarea value={draft.notes} disabled={!editable} maxLength={4000} placeholder="入场理由、失效条件或纪律提醒" onChange={event => set('notes', event.target.value)}/></label>
         </div>
       </details>
@@ -263,7 +298,7 @@ function AdvancedDetails({ risk, record }: { risk: RiskCalculation | null; recor
         {record.executionRisk?.liquidationEstimate && <LiquidationScenario label="当前实际仓位" value={record.executionRisk.liquidationEstimate}/>}
       </div>
       {risk?.adverseMoveLosses?.length ? <div className="v05-adverse"><h3>计划加仓后的反向移动</h3>{risk.adverseMoveLosses.map(row => <span key={row.movePercent}>反向 {row.movePercent}%：{money(row.lossUsdt)} USDT（权益 {percent(row.equityPercent)}）</span>)}</div> : null}
-      {[...(risk?.warnings ?? []), ...(risk?.assumptions ?? [])].map(message => <div className="v05-note" key={message}>{message}</div>)}
+      {[...(risk?.warnings ?? []), ...(risk?.assumptions ?? [])].map(message => <div className="v05-note" key={message}>{riskMessage(message)}</div>)}
     </div>
   </details>
 }
@@ -428,6 +463,7 @@ export default function WorkbenchView() {
     </section>
 
     <p className="v05-estimate-disclaimer">本工具没有读取OKX账户，强平价为基于当前输入和公开规则的估算，以OKX实际显示为准。</p>
+    <p className="v05-estimate-assumptions">估算假设：只存在 BTC-USDT-SWAP 这一项全仓仓位；没有其他全仓或逐仓仓位影响账户权益；没有待成交挂单占用保证金；没有未知账户级费用或资产折算。实际强平以 OKX 标记价格和账户页面为准；工具未读取账户来核实这些条件。</p>
 
     {liquidationDanger(activeLiquidation) && <div className="v05-critical-warning" role="alert"><AlertTriangle/>按当前估算，仓位可能在计划止损生效前进入强平区域。</div>}
 
@@ -441,6 +477,7 @@ export default function WorkbenchView() {
         plannedRisk={currentRisk} executionRisk={chartExecutionRisk} actualFills={chartActualFills}
         stale={snapshot.stale} connectionStatus={socketConnected ? snapshot.connectionStatus : 'reconnecting'} candleStatus={snapshot.candleStatus}
       />
+      <p className="v05-candle-window-note"><strong>本地保留窗口：</strong>1m 最近 7 天（最多 10,080 根）；15m 最近 90 天（最多 8,640 根）；1H、4H 保留已同步的研究历史，不做滚动裁剪。<strong>当前首屏加载窗口上限：</strong>1m 720 根、15m 672 根、1H 200 根、4H 200 根；冷启动时可能更少，随后通过公共 WebSocket 增量更新。当前未实现向左分页加载更早数据。</p>
     </section>
 
     <section className="v05-comparison" aria-label="计划模拟与实际成交对比">
@@ -460,7 +497,7 @@ export default function WorkbenchView() {
         </div>
         <p>风险等级只描述“到硬止损时预计损失占权益的比例”，不代表行情成功概率，也不构成盈利保证。</p>
         <p><strong>强平距离独立判断：</strong>估算强平价、距离风险和硬止损先后顺序只渲染后端结果；硬止损不等于交易所一定能在强平前成交。</p>
-        {activeLiquidation?.warnings?.map(message => <div className="v05-warning" key={message}><AlertTriangle/>{message}</div>)}
+        {activeLiquidation?.warnings?.map(message => <div className="v05-warning" key={message}><AlertTriangle/>{riskMessage(message)}</div>)}
       </aside>
     </section>
 

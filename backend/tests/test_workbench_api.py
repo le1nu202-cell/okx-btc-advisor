@@ -281,6 +281,51 @@ async def test_mark_price_only_refreshes_backend_plan_and_actual_liquidation_dis
     assert [frame for frame in frames if frame.get("type") == "tradePlanUpdate"][0]["plan"]["executionRisk"]["liquidationEstimate"]["referenceMarkPrice"] == 77.9
 
 
+def test_follow_equity_open_position_keeps_frozen_basis_when_another_draft_changes_equity(tmp_path, monkeypatch):
+    local = Database(tmp_path / "frozen-liquidation-equity.db")
+    monkeypatch.setattr(main, "db", local)
+    now = int(time.time() * 1000)
+    monkeypatch.setitem(main.runtime, "mark_price", 100.0)
+    monkeypatch.setitem(main.runtime, "mark_price_ts", now)
+    payload = {
+        **BASE_PLAN,
+        "marginMode": "CROSS",
+        "equity": 80,
+        "crossEquityMode": "FOLLOW_EQUITY",
+        "crossAvailableEquity": 12,
+        "maintenanceMarginSource": "MANUAL",
+        "maintenanceMarginRate": 0.005,
+        "takerFeeBps": 5,
+        "liquidationFeeMode": "FOLLOW_TAKER",
+        "liquidationFeeBps": 99,
+    }
+    with TestClient(main.app) as client:
+        created = client.post("/api/trade-plans", json=payload).json()
+        assert created["plan"]["crossAvailableEquity"] == 80
+        assert created["plan"]["liquidationFeeBps"] == 5
+        quantity = created["risk"]["initialQuantityBtc"]
+        opened = client.post(
+            f"/api/trade-plans/{created['id']}/actions",
+            json={"action": "CONFIRM_INITIAL", "price": 100, "quantityBtc": quantity},
+        ).json()["plan"]
+        estimate = opened["executionRisk"]["liquidationEstimate"]
+        expected_support = 80 - 100 * quantity * (payload["makerFeeBps"] / 10_000)
+        assert opened["liquidationEquityBasisUsdt"] == 80
+        assert estimate["crossEquityBasisFrozen"] is True
+        assert estimate["crossEquityBasisUsdt"] == 80
+        assert estimate["supportingEquityUsdt"] == pytest.approx(expected_support)
+        assert estimate["liquidationFeeMode"] == "FOLLOW_TAKER"
+        assert estimate["liquidationFeeRate"] == pytest.approx(0.0005)
+
+        calculated = client.post("/api/workbench/calculate", json={**payload, "equity": 100}).json()
+        assert calculated["liquidationScenarios"]["initialOnly"]["crossEquityBasisUsdt"] == 100
+        restored = client.get("/api/trade-plans/current").json()
+        restored_estimate = restored["executionRisk"]["liquidationEstimate"]
+        assert restored["liquidationEquityBasisUsdt"] == 80
+        assert restored_estimate["crossEquityBasisUsdt"] == 80
+        assert restored_estimate["supportingEquityUsdt"] == pytest.approx(expected_support)
+
+
 def test_planned_update_clears_stale_price_reminder(tmp_path, monkeypatch):
     local = Database(tmp_path / "update-reminder.db")
     monkeypatch.setattr(main, "db", local)

@@ -18,6 +18,80 @@
   line-height: 1.5;
 }
 
+.v05-estimate-assumptions,
+.v05-candle-window-note {
+  margin: 4px 2px 0;
+  color: #82918c;
+  font-size: 11px;
+  line-height: 1.55;
+}
+
+.v05-candle-window-note {
+  margin-top: 10px;
+  padding-top: 9px;
+  border-top: 1px solid #273139;
+}
+
+.v05-candle-window-note strong {
+  margin-right: 4px;
+  color: #a9b8b3;
+}
+
+.v05-candle-window-note strong:nth-of-type(2) {
+  margin-left: 12px;
+}
+
+.v05-field > span > small {
+  display: block;
+  margin-top: 2px;
+  color: #6f9f8e;
+  font-size: 10px;
+}
+
+.v05-field input[readonly]:not(:disabled) {
+  border-style: dashed;
+  border-color: #3b6656;
+  background: #0e1915;
+  color: #9bd6bf;
+  cursor: default;
+}
+
+.v05-input-explanation,
+.v05-liquidation-assumptions,
+.v05-input-mismatch {
+  grid-column: 1 / -1;
+  padding: 10px 12px;
+  border: 1px solid #34434a;
+  border-radius: 8px;
+  background: #0b1217;
+  color: #91a09b;
+  font-size: 11px;
+  line-height: 1.55;
+}
+
+.v05-input-explanation strong,
+.v05-input-explanation span,
+.v05-liquidation-assumptions strong,
+.v05-liquidation-assumptions span {
+  display: block;
+}
+
+.v05-input-explanation strong,
+.v05-liquidation-assumptions strong {
+  margin-bottom: 3px;
+  color: #c0d0ca;
+}
+
+.v05-input-explanation span + span {
+  margin-top: 4px;
+}
+
+.v05-input-mismatch {
+  border-color: #745c2f;
+  background: #211b10;
+  color: #e6c57e;
+}
+
 .v05-critical-warning svg {
   width: 19px;
   flex: none;

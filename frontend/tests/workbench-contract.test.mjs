@@ -9,14 +9,32 @@ test('v0.4 默认参数符合 80U、66x、4%、2 倍和成本约定', () => {
   assert.equal(DEFAULT_PLAN.leverage, 66)
   assert.equal(DEFAULT_PLAN.initialMarginPercent, 4)
   assert.equal(DEFAULT_PLAN.addMultiplier, 2)
+  assert.equal(DEFAULT_PLAN.crossEquityMode, 'FOLLOW_EQUITY')
+  assert.equal(DEFAULT_PLAN.liquidationFeeMode, 'FOLLOW_TAKER')
   assert.deepEqual([DEFAULT_PLAN.makerFeeBps, DEFAULT_PLAN.takerFeeBps, DEFAULT_PLAN.slippageBps], [2, 5, 5])
 })
 
-test('v0.4 旧计划缺全仓可用权益时沿用该计划权益而不是新计划默认 80U', () => {
+test('v0.4 旧计划缺全仓支持余额字段时沿用该计划权益而不是新计划默认 80U', () => {
   const legacy = { ...DEFAULT_PLAN, equity: 123 }
   delete legacy.crossAvailableEquity
+  delete legacy.crossEquityMode
   assert.equal(normalizeTradePlanDraft(legacy).crossAvailableEquity, 123)
-  assert.equal(normalizeTradePlanDraft({ ...legacy, crossAvailableEquity: 45 }).crossAvailableEquity, 45)
+  assert.equal(normalizeTradePlanDraft(legacy).crossEquityMode, 'FOLLOW_EQUITY')
+  const oldIndependent = normalizeTradePlanDraft({ ...legacy, crossAvailableEquity: 45 })
+  assert.equal(oldIndependent.crossEquityMode, 'MANUAL')
+  assert.equal(oldIndependent.crossAvailableEquity, 45)
+})
+
+test('旧强平费率按是否等于 Taker 推断模式，显式手动模式永不被覆盖', () => {
+  const legacy = { ...DEFAULT_PLAN }
+  delete legacy.liquidationFeeMode
+  assert.equal(normalizeTradePlanDraft({ ...legacy, takerFeeBps: 7, liquidationFeeBps: 7 }).liquidationFeeMode, 'FOLLOW_TAKER')
+  const oldIndependent = normalizeTradePlanDraft({ ...legacy, takerFeeBps: 7, liquidationFeeBps: 12 })
+  assert.equal(oldIndependent.liquidationFeeMode, 'MANUAL')
+  assert.equal(oldIndependent.liquidationFeeBps, 12)
+  const explicitManual = normalizeTradePlanDraft({ ...DEFAULT_PLAN, takerFeeBps: 7, liquidationFeeBps: 7, liquidationFeeMode: 'MANUAL' })
+  assert.equal(explicitManual.liquidationFeeMode, 'MANUAL')
+  assert.equal(explicitManual.liquidationFeeBps, 7)
 })
 
 test('四价顺序对做多和做空分别给出中文错误', () => {

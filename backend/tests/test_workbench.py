@@ -5,6 +5,8 @@ import pytest
 from backend.db import Database
 from backend.models import Candle
 from backend.workbench import (
+    CrossEquityMode,
+    LiquidationFeeMode,
     MarginMode,
     ReplayCreateRequest,
     RiskCalculation,
@@ -59,6 +61,63 @@ def test_long_fixed_vector_uses_fill_specific_quantities_and_exact_average():
     assert result.average_entry_price != pytest.approx((100 + 2 * 90) / 3)
     assert result.net_loss_at_stop == pytest.approx(16.8888888889)
     assert result.net_profit_at_take_profit == pytest.approx(10.7586206897)
+
+
+def test_follow_modes_sync_and_legacy_json_infers_manual_only_for_distinct_values():
+    followed = TradePlanDraft.model_validate({
+        **plan().model_dump(by_alias=True),
+        "equity": 100,
+        "crossEquityMode": "FOLLOW_EQUITY",
+        "crossAvailableEquity": 12,
+        "takerFeeBps": 7,
+        "liquidationFeeMode": "FOLLOW_TAKER",
+        "liquidationFeeBps": 99,
+    })
+    assert followed.cross_equity_mode == CrossEquityMode.FOLLOW_EQUITY
+    assert followed.cross_available_equity == 100
+    assert followed.liquidation_fee_mode == LiquidationFeeMode.FOLLOW_TAKER
+    assert followed.liquidation_fee_bps == 7
+
+    # Simulate fields being absent, not explicit null, in a v0.5 JSON blob.
+    legacy_payload = followed.model_dump(by_alias=True)
+    legacy_payload.pop("crossEquityMode")
+    legacy_payload.pop("liquidationFeeMode")
+    legacy_payload["crossAvailableEquity"] = 40
+    legacy_payload["liquidationFeeBps"] = 11
+    inferred_manual = TradePlanDraft.model_validate(legacy_payload)
+    assert inferred_manual.cross_equity_mode == CrossEquityMode.MANUAL
+    assert inferred_manual.cross_available_equity == 40
+    assert inferred_manual.liquidation_fee_mode == LiquidationFeeMode.MANUAL
+    assert inferred_manual.liquidation_fee_bps == 11
+
+    equal_payload = {**legacy_payload, "crossAvailableEquity": 100, "liquidationFeeBps": 7}
+    inferred_follow = TradePlanDraft.model_validate(equal_payload)
+    assert inferred_follow.cross_equity_mode == CrossEquityMode.FOLLOW_EQUITY
+    assert inferred_follow.cross_available_equity == inferred_follow.equity == 100
+    assert inferred_follow.liquidation_fee_mode == LiquidationFeeMode.FOLLOW_TAKER
+    assert inferred_follow.liquidation_fee_bps == inferred_follow.taker_fee_bps == 7
+
+    with pytest.raises(ValueError, match="crossAvailableEquity"):
+        TradePlanDraft.model_validate({**equal_payload, "crossEquityMode": "MANUAL", "crossAvailableEquity": None})
+
+
+def test_initial_fill_freezes_equity_basis_and_legacy_open_fill_is_lazily_migrated():
+    configured = plan(equity=80, cross_equity_mode="FOLLOW_EQUITY", cross_available_equity=12)
+    opened, _ = apply_action(
+        make_plan_record(configured),
+        TradeActionRequest(action=TradeAction.CONFIRM_INITIAL, price=100, quantity_btc=0.4),
+    )
+    assert opened["liquidationEquityBasisUsdt"] == 80
+
+    changed_plan = {**opened["plan"], "equity": 100, "crossAvailableEquity": 100}
+    recomputed = recompute_execution({**opened, "plan": changed_plan})
+    assert recomputed["liquidationEquityBasisUsdt"] == 80
+
+    legacy = make_plan_record(plan(equity=80, cross_equity_mode="MANUAL", cross_available_equity=40))
+    legacy["plan"].pop("crossEquityMode")
+    legacy["actualFills"] = {"initial": {"price": 100, "quantityBtc": 0.4}}
+    migrated = recompute_execution(legacy)
+    assert migrated["liquidationEquityBasisUsdt"] == 40
 
 
 def test_short_fixed_vector_and_directional_order():

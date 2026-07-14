@@ -30,6 +30,16 @@ class MaintenanceMarginSource(str, Enum):
     MANUAL = "MANUAL"
 
 
+class CrossEquityMode(str, Enum):
+    FOLLOW_EQUITY = "FOLLOW_EQUITY"
+    MANUAL = "MANUAL"
+
+
+class LiquidationFeeMode(str, Enum):
+    FOLLOW_TAKER = "FOLLOW_TAKER"
+    MANUAL = "MANUAL"
+
+
 class SizingMode(str, Enum):
     MARGIN = "MARGIN"
     MAX_LOSS = "MAX_LOSS"
@@ -100,11 +110,13 @@ class TradePlanDraft(APIModel):
     taker_fee_bps: float = Field(default=5.0, ge=0, le=100)
     slippage_bps: float = Field(default=5.0, ge=0, le=500)
     margin_mode: MarginMode = MarginMode.CROSS
+    cross_equity_mode: CrossEquityMode = CrossEquityMode.FOLLOW_EQUITY
     cross_available_equity: float | None = Field(default=None, ge=0, le=1_000_000_000)
     extra_margin_usdt: float = Field(default=0.0, ge=0, le=1_000_000_000)
     maintenance_margin_source: MaintenanceMarginSource = MaintenanceMarginSource.AUTO
     maintenance_margin_rate: float | None = Field(default=None, ge=0, lt=1)
     maintenance_margin_fixed_usdt: float = Field(default=0.0, ge=0, le=1_000_000_000)
+    liquidation_fee_mode: LiquidationFeeMode = LiquidationFeeMode.FOLLOW_TAKER
     liquidation_fee_bps: float = Field(default=5.0, ge=0, le=1_000)
     include_unsettled_funding: bool = False
     unsettled_funding_usdt: float = Field(default=0.0, ge=-1_000_000_000, le=1_000_000_000)
@@ -118,6 +130,52 @@ class TradePlanDraft(APIModel):
     approach_threshold_percent: float = Field(default=0.25, gt=0, le=5)
     notes: str = Field(default="", max_length=4000)
     screenshot_path: str | None = Field(default=None, max_length=1000)
+
+    @model_validator(mode="before")
+    @classmethod
+    def infer_legacy_follow_modes(cls, value: Any):
+        """Preserve v0.5 independent values while adding explicit modes.
+
+        Old JSON had no mode fields. Equal (or missing) values represented the
+        defaults and migrate to FOLLOW; an independently changed legacy value
+        migrates to MANUAL so its economic meaning is not overwritten.
+        """
+        if not isinstance(value, dict):
+            return value
+        data = dict(value)
+
+        def present(*names: str) -> bool:
+            return any(name in data for name in names)
+
+        def raw(*names: str, default: Any = None) -> Any:
+            for name in names:
+                if name in data and data[name] is not None:
+                    return data[name]
+            return default
+
+        def differs(left: Any, right: Any) -> bool:
+            try:
+                return not math.isclose(float(left), float(right), rel_tol=1e-12, abs_tol=1e-12)
+            except (TypeError, ValueError, OverflowError):
+                return True
+
+        if not present("crossEquityMode", "cross_equity_mode"):
+            equity = raw("equity", default=80.0)
+            cross = raw("crossAvailableEquity", "cross_available_equity")
+            data["cross_equity_mode"] = (
+                CrossEquityMode.MANUAL.value
+                if cross is not None and differs(cross, equity)
+                else CrossEquityMode.FOLLOW_EQUITY.value
+            )
+        if not present("liquidationFeeMode", "liquidation_fee_mode"):
+            taker = raw("takerFeeBps", "taker_fee_bps", default=5.0)
+            liquidation = raw("liquidationFeeBps", "liquidation_fee_bps")
+            data["liquidation_fee_mode"] = (
+                LiquidationFeeMode.MANUAL.value
+                if liquidation is not None and differs(liquidation, taker)
+                else LiquidationFeeMode.FOLLOW_TAKER.value
+            )
+        return data
 
     @field_validator("screenshot_path")
     @classmethod
@@ -133,6 +191,12 @@ class TradePlanDraft(APIModel):
 
     @model_validator(mode="after")
     def ordered_risk_thresholds(self):
+        if self.cross_equity_mode == CrossEquityMode.FOLLOW_EQUITY:
+            self.cross_available_equity = self.equity
+        elif self.cross_available_equity is None:
+            raise ValueError("手动全仓支持余额基准模式必须填写 crossAvailableEquity")
+        if self.liquidation_fee_mode == LiquidationFeeMode.FOLLOW_TAKER:
+            self.liquidation_fee_bps = self.taker_fee_bps
         if not (self.risk_low_max_percent <= self.risk_medium_max_percent <= self.risk_high_max_percent):
             raise ValueError("风险等级阈值必须依次递增")
         if self.sizing_mode == SizingMode.MAX_LOSS and self.max_loss_usdt is None:
@@ -669,6 +733,17 @@ def recompute_execution(record: dict[str, Any]) -> dict[str, Any]:
         })
     execution_risk["riskLevel"] = _risk_level(float(execution_risk["maxLossEquityPercent"]), plan)
     updated = dict(record)
+    if initial:
+        try:
+            persisted_basis = float(record.get("liquidationEquityBasisUsdt"))
+        except (TypeError, ValueError, OverflowError):
+            persisted_basis = math.nan
+        if not math.isfinite(persisted_basis) or persisted_basis < 0:
+            persisted_basis = float(plan.cross_available_equity if plan.cross_available_equity is not None else plan.equity)
+        # Freeze the available-equity component at the first manual fill. A
+        # later FOLLOW_EQUITY form update must not rewrite an open position's
+        # already-established liquidation balance basis.
+        updated["liquidationEquityBasisUsdt"] = persisted_basis
     updated["actualFills"] = fills
     updated["realizedSegments"] = segments
     updated["execution"] = execution

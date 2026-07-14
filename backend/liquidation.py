@@ -333,21 +333,61 @@ def _plan_value(plan: Mapping[str, Any], camel: str, snake: str | None = None, d
     return default
 
 
+def _mode_value(plan: Mapping[str, Any], camel: str, snake: str, default: str | None = None) -> str | None:
+    raw = _plan_value(plan, camel, snake, default)
+    if raw is None:
+        return None
+    return str(getattr(raw, "value", raw)).upper()
+
+
+def _different_numbers(left: float | None, right: float | None) -> bool:
+    if left is None or right is None:
+        return False
+    return not math.isclose(left, right, rel_tol=1e-12, abs_tol=1e-12)
+
+
+def _resolved_cross_equity(plan: Mapping[str, Any]) -> tuple[str, float | None]:
+    equity = _number(plan, "equity", default=80.0)
+    manual = _number(plan, "crossAvailableEquity", "cross_available_equity")
+    mode = _mode_value(plan, "crossEquityMode", "cross_equity_mode")
+    if mode is None:
+        # v0.5 compatibility: a distinct persisted value was intentionally
+        # manual; equal/missing values migrate to the new FOLLOW default.
+        mode = "MANUAL" if manual is not None and _different_numbers(manual, equity) else "FOLLOW_EQUITY"
+    if mode == "MANUAL":
+        return mode, manual
+    return "FOLLOW_EQUITY", equity
+
+
+def _resolved_liquidation_fee(plan: Mapping[str, Any]) -> tuple[str, float | None]:
+    taker = _number(plan, "takerFeeBps", "taker_fee_bps", default=5.0)
+    manual = _number(plan, "liquidationFeeBps", "liquidation_fee_bps")
+    mode = _mode_value(plan, "liquidationFeeMode", "liquidation_fee_mode")
+    if mode is None:
+        mode = "MANUAL" if manual is not None and _different_numbers(manual, taker) else "FOLLOW_TAKER"
+    if mode == "MANUAL":
+        return mode, manual
+    return "FOLLOW_TAKER", taker
+
+
 def _supporting_equity(
     plan: Mapping[str, Any],
     *,
     realised_gross_pnl: float = 0.0,
     incurred_fees_usdt: float = 0.0,
+    available_equity_override: float | None = None,
 ) -> float:
-    available = _plan_value(plan, "crossAvailableEquity", "cross_available_equity")
-    if available is None:
-        available = _plan_value(plan, "equity", default=0.0)
+    _, resolved_available = _resolved_cross_equity(plan)
+    available = available_equity_override if available_equity_override is not None else resolved_available
     extra = _plan_value(plan, "extraMarginUsdt", "extra_margin_usdt", 0.0) or 0.0
     funding = 0.0
     include_funding = bool(_plan_value(plan, "includeUnsettledFunding", "include_unsettled_funding", False))
     if include_funding:
         funding = _plan_value(plan, "unsettledFundingUsdt", "unsettled_funding_usdt", 0.0) or 0.0
-    return float(available) + float(extra) + float(realised_gross_pnl) - float(incurred_fees_usdt) - float(funding)
+    try:
+        return float(available) + float(extra) + float(realised_gross_pnl) - float(incurred_fees_usdt) - float(funding)
+    except (TypeError, ValueError, OverflowError):
+        return math.nan
 
 
 def _estimate_for_position(
@@ -362,8 +402,13 @@ def _estimate_for_position(
     evaluated_at: int | None,
     public_context: Mapping[str, Any] | None,
     scope: str,
+    equity_basis_override: float | None = None,
+    equity_basis_frozen: bool = False,
 ) -> dict[str, Any]:
     parameters = liquidation_parameters(plan, quantity_btc, public_context)
+    equity_mode, configured_equity_basis = _resolved_cross_equity(plan)
+    equity_basis = equity_basis_override if equity_basis_override is not None else configured_equity_basis
+    liquidation_fee_mode, liquidation_fee_bps = _resolved_liquidation_fee(plan)
     inputs = LiquidationInputs(
         direction=str(_plan_value(plan, "direction", default="")),
         quantity_btc=float(quantity_btc or 0),
@@ -372,12 +417,13 @@ def _estimate_for_position(
             plan,
             realised_gross_pnl=realised_gross_pnl,
             incurred_fees_usdt=incurred_fees_usdt,
+            available_equity_override=equity_basis_override,
         ),
         maintenance_margin_rate=parameters.get("maintenanceMarginRate"),
         # AUTO deliberately ignores any manual fields left in a persisted form
         # after switching modes; only the selected public tier is authoritative.
         maintenance_margin_fixed_usdt=float(parameters.get("maintenanceMarginFixedUsdt") or 0.0),
-        liquidation_fee_rate=float(_plan_value(plan, "liquidationFeeBps", "liquidation_fee_bps", 5.0) or 0.0) / 10_000,
+        liquidation_fee_rate=float(liquidation_fee_bps) / 10_000 if liquidation_fee_bps is not None else math.nan,
         stop_price=_number(plan, "stopPrice", "stop_price"),
         mark_price=mark_price,
         mark_price_time=mark_price_time,
@@ -397,6 +443,24 @@ def _estimate_for_position(
         result = _unavailable(inputs, ["全仓估算要求 assumeNoOtherPositions=true；共享仓位权益未知"])
     else:
         result = estimate_liquidation(inputs)
+    result["crossEquityMode"] = equity_mode
+    result["crossEquityBasisUsdt"] = float(equity_basis) if _finite(equity_basis, nonnegative=True) else None
+    result["crossEquityBasisFrozen"] = bool(equity_basis_frozen)
+    result["liquidationFeeMode"] = liquidation_fee_mode
+    result["assumptions"] = [
+        *list(result.get("assumptions") or []),
+        (
+            "实际开仓时的全仓支持余额基准已冻结，不随之后的计划草稿变化"
+            if equity_basis_frozen
+            else "开仓前的全仓支持余额基准跟随账户权益"
+            if equity_mode == "FOLLOW_EQUITY"
+            else "开仓前的全仓支持余额基准使用手动输入值"
+        ),
+        "全仓支持余额基准是支撑当前单一全仓仓位的账户余额基准，不是扣除仓位或挂单占用后的可用保证金；当前仓位未实现盈亏单独计算",
+        "假设只存在 BTC-USDT-SWAP 这一项全仓仓位，没有其他全仓或逐仓仓位影响账户权益，也没有待成交挂单占用保证金",
+        "假设没有未知账户级费用或资产折算；实际强平以 OKX 标记价格和账户页面为准",
+        "预计强平手续费率跟随 Taker 费率" if liquidation_fee_mode == "FOLLOW_TAKER" else "预计强平手续费率使用手动输入值",
+    ]
     result["warnings"] = list(parameters.get("warnings") or []) + list(result.get("warnings") or [])
     if not assume_no_other_positions:
         result["warnings"].append("账户其他仓位会共享权益，因此不输出可能误导的强平价格")
@@ -490,6 +554,12 @@ def actual_liquidation_estimate(
     average = _number(execution, "averageEntryPrice")
     realised_gross = _number(execution, "realizedGrossPnl", default=0.0) or 0.0
     fills = record.get("actualFills") if isinstance(record.get("actualFills"), Mapping) else {}
+    has_initial_fill = "initial" in fills
+    frozen_equity_basis = _number(record, "liquidationEquityBasisUsdt", "liquidation_equity_basis_usdt")
+    if has_initial_fill and frozen_equity_basis is None:
+        # Lazy v0.5 compatibility for records not yet re-saved by
+        # recompute_execution: infer old independent values before estimating.
+        _, frozen_equity_basis = _resolved_cross_equity(plan)
     maker = (_number(plan, "makerFeeBps", "maker_fee_bps", default=0.0) or 0.0) / 10_000
     taker = (_number(plan, "takerFeeBps", "taker_fee_bps", default=0.0) or 0.0) / 10_000
     incurred_fees = 0.0
@@ -512,4 +582,6 @@ def actual_liquidation_estimate(
         evaluated_at=evaluated_at,
         public_context=public_context,
         scope="ACTUAL_REMAINING",
+        equity_basis_override=frozen_equity_basis if has_initial_fill else None,
+        equity_basis_frozen=has_initial_fill,
     )

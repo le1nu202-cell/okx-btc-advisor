@@ -4,6 +4,8 @@ export type TradeDirection = 'LONG' | 'SHORT'
 export type TradeState = 'IDLE' | 'PLANNED' | 'INITIAL_OPEN' | 'APPROACHING_ADD' | 'ADDED' | 'REDUCE_ZONE' | 'PARTIALLY_REDUCED' | 'TAKE_PROFIT' | 'STOPPED' | 'CANCELLED'
 export type TradeAction = 'CONFIRM_INITIAL' | 'CONFIRM_ADD' | 'CONFIRM_REDUCE' | 'CONFIRM_TAKE_PROFIT' | 'CONFIRM_STOP' | 'CANCEL'
 export type FillAction = Exclude<TradeAction, 'CANCEL'>
+export type CrossEquityMode = 'FOLLOW_EQUITY' | 'MANUAL'
+export type LiquidationFeeMode = 'FOLLOW_TAKER' | 'MANUAL'
 
 export interface TradePlanDraft {
   instrument: 'BTC-USDT-SWAP'
@@ -17,11 +19,13 @@ export interface TradePlanDraft {
   initialMargin: number | null
   initialMarginPercent: number
   addMultiplier: number
+  crossEquityMode: CrossEquityMode
   crossAvailableEquity: number
   extraMarginUsdt: number
   maintenanceMarginSource: 'AUTO' | 'MANUAL'
   maintenanceMarginRate: number | null
   maintenanceMarginFixedUsdt: number
+  liquidationFeeMode: LiquidationFeeMode
   liquidationFeeBps: number
   includeUnsettledFunding: boolean
   unsettledFundingUsdt: number
@@ -59,13 +63,18 @@ export interface LiquidationEstimate {
   quantityBtc: number | null
   averageEntryPrice: number | null
   supportingEquityUsdt: number | null
+  crossEquityMode?: CrossEquityMode
+  crossEquityBasisUsdt?: number | null
+  crossEquityBasisFrozen?: boolean
   maintenanceMarginRate: number | null
   maintenanceMarginFixedUsdt: number | null
   liquidationFeeRate: number | null
+  liquidationFeeMode?: LiquidationFeeMode
   tier: number | string | null
   contracts: number | null
   parameterSource: 'OKX_PUBLIC' | 'MANUAL' | 'UNAVAILABLE'
   parametersUpdatedAt: number | null
+  scope?: string
   changeFromPreviousUsdt?: number | null
   assumptions: string[]
   warnings: string[]
@@ -197,6 +206,7 @@ export interface TradePlanRecord {
   executionSummary?: ExecutionSummary | null
   execution?: ExecutionSummary | null
   executionRisk?: ExecutionRisk | null
+  liquidationEquityBasisUsdt?: number | null
   realizedSegments?: RealizedSegment[]
   activeReminder?: ActiveReminder | null
   events?: Array<{ type: string; price?: number | null; at?: number; message?: string }>
@@ -324,11 +334,13 @@ export const DEFAULT_PLAN: TradePlanDraft = {
   initialMargin: null,
   initialMarginPercent: 4,
   addMultiplier: 2,
+  crossEquityMode: 'FOLLOW_EQUITY',
   crossAvailableEquity: 80,
   extraMarginUsdt: 0,
   maintenanceMarginSource: 'AUTO',
   maintenanceMarginRate: null,
   maintenanceMarginFixedUsdt: 0,
+  liquidationFeeMode: 'FOLLOW_TAKER',
   liquidationFeeBps: 5,
   includeUnsettledFunding: false,
   unsettledFundingUsdt: 0,
@@ -348,6 +360,11 @@ export const DEFAULT_PLAN: TradePlanDraft = {
   screenshotPath: null,
 }
 
+const differentPlanNumber = (left: number, right: number) => {
+  const tolerance = Math.max(1e-12, 1e-12 * Math.max(Math.abs(left), Math.abs(right)))
+  return Math.abs(left - right) > tolerance
+}
+
 /**
  * Hydrate additive v0.5 inputs without changing the economics of a v0.4 plan.
  * Legacy rows did not persist crossAvailableEquity; liquidation already treats
@@ -356,10 +373,25 @@ export const DEFAULT_PLAN: TradePlanDraft = {
  */
 export const normalizeTradePlanDraft = (plan: Partial<TradePlanDraft> | null | undefined): TradePlanDraft => {
   const merged = { ...DEFAULT_PLAN, ...(plan ?? {}) }
+  const crossEquityMode: CrossEquityMode = plan?.crossEquityMode === 'FOLLOW_EQUITY' || plan?.crossEquityMode === 'MANUAL'
+    ? plan.crossEquityMode
+    : typeof plan?.crossAvailableEquity === 'number' && differentPlanNumber(plan.crossAvailableEquity, merged.equity)
+      ? 'MANUAL'
+      : 'FOLLOW_EQUITY'
+  const liquidationFeeMode: LiquidationFeeMode = plan?.liquidationFeeMode === 'FOLLOW_TAKER' || plan?.liquidationFeeMode === 'MANUAL'
+    ? plan.liquidationFeeMode
+    : typeof plan?.liquidationFeeBps === 'number' && differentPlanNumber(plan.liquidationFeeBps, merged.takerFeeBps)
+      ? 'MANUAL'
+      : 'FOLLOW_TAKER'
   return {
     ...merged,
-    crossAvailableEquity: typeof plan?.crossAvailableEquity === 'number'
-      ? plan.crossAvailableEquity
-      : merged.equity,
+    crossEquityMode,
+    crossAvailableEquity: crossEquityMode === 'FOLLOW_EQUITY'
+      ? merged.equity
+      : typeof plan?.crossAvailableEquity === 'number' ? plan.crossAvailableEquity : merged.equity,
+    liquidationFeeMode,
+    liquidationFeeBps: liquidationFeeMode === 'FOLLOW_TAKER'
+      ? merged.takerFeeBps
+      : typeof plan?.liquidationFeeBps === 'number' ? plan.liquidationFeeBps : merged.takerFeeBps,
   }
 }
