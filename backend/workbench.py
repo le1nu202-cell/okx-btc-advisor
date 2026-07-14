@@ -45,6 +45,30 @@ class TradeState(str, Enum):
 
 TERMINAL_STATES = {TradeState.TAKE_PROFIT, TradeState.STOPPED, TradeState.CANCELLED}
 
+# v0.4 initially persisted two market-reminder phases in the same field as
+# manually confirmed execution states. Keep accepting those values so existing
+# local SQLite payloads remain readable, but normalize them at live-plan
+# boundaries. Replay has its own simulated state machine and intentionally does
+# not use this helper.
+LEGACY_LIVE_STATE_MAP = {
+    TradeState.APPROACHING_ADD: TradeState.INITIAL_OPEN,
+    TradeState.REDUCE_ZONE: TradeState.ADDED,
+}
+
+
+def canonical_live_execution_state(value: TradeState | str) -> TradeState:
+    state = value if isinstance(value, TradeState) else TradeState(value)
+    return LEGACY_LIVE_STATE_MAP.get(state, state)
+
+
+def normalize_live_execution_state(record: dict[str, Any]) -> dict[str, Any]:
+    """Lazily repair legacy live reminder states without a schema migration."""
+    current = TradeState(record["state"])
+    canonical = canonical_live_execution_state(current)
+    if canonical == current:
+        return record
+    return {**record, "state": canonical.value}
+
 
 class TradeAction(str, Enum):
     CONFIRM_INITIAL = "CONFIRM_INITIAL"
@@ -427,10 +451,16 @@ def calculate_risk(plan: TradePlanDraft) -> RiskCalculation:
 
 def _fill_object(value: Any, default_quantity: float = 0.0) -> dict[str, float] | None:
     """Read both v0.4 fill objects and legacy numeric prices."""
+    confirmed_at: float | None = None
     if isinstance(value, dict):
         try:
             price = float(value.get("price"))
             quantity = float(value.get("quantityBtc", value.get("quantity_btc")))
+            raw_confirmed_at = value.get("confirmedAt", value.get("confirmed_at"))
+            if raw_confirmed_at is not None:
+                candidate = float(raw_confirmed_at)
+                if math.isfinite(candidate) and candidate > 0:
+                    confirmed_at = int(candidate)
         except (TypeError, ValueError, OverflowError):
             return None
     elif isinstance(value, (int, float)) and not isinstance(value, bool):
@@ -439,7 +469,10 @@ def _fill_object(value: Any, default_quantity: float = 0.0) -> dict[str, float] 
         return None
     if not all(math.isfinite(item) and item > 0 for item in (price, quantity)):
         return None
-    return {"price": price, "quantityBtc": quantity}
+    fill = {"price": price, "quantityBtc": quantity}
+    if confirmed_at is not None:
+        fill["confirmedAt"] = confirmed_at
+    return fill
 
 
 def normalized_actual_fills(record: dict[str, Any]) -> dict[str, dict[str, float]]:
@@ -690,9 +723,10 @@ def apply_action(record: dict[str, Any], request: TradeActionRequest) -> tuple[d
 
     updated = dict(record)
     updated["state"] = target.value
-    updated["updatedAt"] = now_ms()
+    confirmed_at = now_ms()
+    updated["updatedAt"] = confirmed_at
     if fill_key != "cancel":
-        fills[fill_key] = {"price": float(request.price), "quantityBtc": quantity}
+        fills[fill_key] = {"price": float(request.price), "quantityBtc": quantity, "confirmedAt": confirmed_at}
     updated["actualFills"] = fills
     if action == TradeAction.CONFIRM_ADD:
         updated["addCount"] = 1
@@ -706,7 +740,7 @@ def price_trigger(record: dict[str, Any], price: float, data_fresh: bool) -> tup
     """Create reminders only; market prices never assert that a real fill occurred."""
     if not data_fresh or not math.isfinite(price) or price <= 0:
         return record, None, None
-    state = TradeState(record["state"])
+    state = canonical_live_execution_state(record["state"])
     if state in TERMINAL_STATES or state == TradeState.IDLE:
         return record, None, None
     plan = TradePlanDraft.model_validate(record["plan"])
@@ -714,13 +748,11 @@ def price_trigger(record: dict[str, Any], price: float, data_fresh: bool) -> tup
     assert plan.initial_entry_price and plan.stop_price and plan.take_profit_price and plan.add_price
     is_long = plan.direction == TradeDirection.LONG
 
-    def reminded(event: str, message: str, reminder_state: TradeState | None = None):
+    def reminded(event: str, message: str):
         previous = dict(record.get("activeReminder") or {})
         if previous.get("type") == event:
             return record, None, None
         updated = dict(record)
-        if reminder_state is not None:
-            updated["state"] = reminder_state.value
         created_at = now_ms()
         updated["activeReminder"] = {"type": event, "message": message, "price": price, "createdAt": created_at, "at": created_at}
         updated["updatedAt"] = now_ms()
@@ -748,11 +780,11 @@ def price_trigger(record: dict[str, Any], price: float, data_fresh: bool) -> tup
         distance = abs(price - plan.add_price) / plan.add_price * 100
         touched = price <= plan.add_price if is_long else price >= plan.add_price
         if touched or distance <= plan.approach_threshold_percent:
-            return reminded("APPROACHING_ADD", "价格已接近或触及加仓位；这里只提醒，不会自动加仓", TradeState.APPROACHING_ADD)
+            return reminded("APPROACHING_ADD", "价格已接近或触及加仓位；这里只提醒，不会自动加仓")
     if state in {TradeState.ADDED, TradeState.REDUCE_ZONE} and risk.reduce_zone_price:
         reached = price >= risk.reduce_zone_price if is_long else price <= risk.reduce_zone_price
         if reached:
-            return reminded("REDUCE_ZONE", "价格已回到全成本减仓区；请人工确认实际减仓价格和 BTC 数量", TradeState.REDUCE_ZONE)
+            return reminded("REDUCE_ZONE", "价格已回到全成本减仓区；请人工确认实际减仓价格和 BTC 数量")
     return record, None, None
 
 

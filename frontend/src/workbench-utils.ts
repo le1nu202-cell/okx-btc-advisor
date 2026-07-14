@@ -6,14 +6,18 @@ export const STATE_LABELS: Record<TradeState, string> = {
   IDLE: '尚未创建计划',
   PLANNED: '计划已保存，等待开仓',
   INITIAL_OPEN: '已确认初始开仓',
-  APPROACHING_ADD: '接近加仓价，等待人工确认',
+  APPROACHING_ADD: '已确认初始开仓',
   ADDED: '已确认加仓',
-  REDUCE_ZONE: '进入减仓区，等待人工确认',
+  REDUCE_ZONE: '已确认加仓',
   PARTIALLY_REDUCED: '已部分减仓',
   TAKE_PROFIT: '已人工确认止盈',
   STOPPED: '已人工确认止损',
   CANCELLED: '计划已取消',
 }
+
+/** 旧记录曾把行情提醒写入 state；仅在 live UI 中映射回真实执行阶段。 */
+export const canonicalExecutionState = (state: TradeState): TradeState =>
+  state === 'APPROACHING_ADD' ? 'INITIAL_OPEN' : state === 'REDUCE_ZONE' ? 'ADDED' : state
 
 export const ACTION_LABELS: Record<TradeAction, string> = {
   CONFIRM_INITIAL: '确认已开仓',
@@ -37,7 +41,10 @@ export const LEGAL_ACTIONS: Record<TradeState, readonly TradeAction[]> = {
   CANCELLED: [],
 }
 
-export const isTerminalState = (state: TradeState) => TERMINAL_STATES.includes(state)
+export const isTerminalState = (state: TradeState) => TERMINAL_STATES.includes(canonicalExecutionState(state))
+
+export const legalActionsForState = (state: TradeState): readonly TradeAction[] =>
+  LEGAL_ACTIONS[canonicalExecutionState(state)]
 
 export function priceOrderError(plan: TradePlanDraft): string {
   const { initialEntryPrice: initial, addPrice: add, stopPrice: stop, takeProfitPrice: take } = plan

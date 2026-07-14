@@ -27,15 +27,38 @@
 | React | 19.2.7 | 用户界面 | MIT |
 | React DOM | 19.2.7 | 浏览器渲染 | MIT |
 | Lucide React | 1.24.0 | 界面图标 | ISC |
+| TradingView Lightweight Charts | 5.2.0 | 本地图表引擎（蜡烛图、价格线、成交标记） | Apache-2.0 |
+| fancy-canvas | 2.1.0 | Lightweight Charts 的 Canvas 渲染依赖 | MIT |
 | Vite | 8.1.4 | 前端开发与生产构建 | MIT |
 | @vitejs/plugin-react | 6.0.3 | Vite React 编译支持 | MIT |
 | TypeScript | 7.0.2 | 前端类型检查与编译 | Apache-2.0 |
 | @types/react | 19.2.17 | React TypeScript 类型 | MIT |
 | @types/react-dom | 19.2.3 | React DOM TypeScript 类型 | MIT |
 
+## 前端测试依赖
+
+| 组件 | 版本 | 用途 | 许可证 |
+|---|---:|---|---|
+| Vitest | 4.1.10 | TypeScript 与 React 单元/组件测试 | MIT |
+| React Testing Library | 16.3.2 | React 真实组件交互测试 | MIT |
+| Testing Library DOM | 10.4.1 | DOM 查询与交互基础 | MIT |
+| Testing Library user-event | 14.6.1 | 浏览器式输入和点击交互 | MIT |
+| jsdom | 29.1.1 | 前端测试 DOM 环境 | MIT |
+
+## TradingView Lightweight Charts NOTICE 与署名
+
+本仓库保留上游 `v5.2.0` 的 NOTICE 与 Apache-2.0 许可证，精确副本分别位于 `third_party/lightweight-charts-NOTICE.txt` 和 `third_party/lightweight-charts-LICENSE.txt`：
+
+```text
+TradingView Lightweight Charts™
+Copyright (с) 2025 TradingView, Inc. https://www.tradingview.com/
+```
+
+工作台显式启用 `layout.attributionLogo: true`，并在图表下方保留指向 TradingView 的用户可见链接。完整许可证为 [Apache License 2.0](https://github.com/tradingview/lightweight-charts/blob/v5.2.0/LICENSE)；上游项目、许可证与本地副本记录在 `docs/COMPONENT_AUDIT.md`。
+
 ## 外部服务和内容
 
 - OKX 公共 REST、`/public` WebSocket 与免鉴权 `/business` K 线 WebSocket 仅用于读取公共市场数据。本项目不包含 OKX API Key、账户访问或交易权限。
 - 新闻模块读取公开的 OKX 公告、CoinDesk、Cointelegraph Bitcoin 与 Decrypt 内容；原内容版权归各发布方所有，本项目只保存必要的元数据、链接和简短分析结果。
 
-本版本没有引入 TradingView Lightweight Charts，也没有加载第三方远程脚本、字体或自动交易 SDK。
+Lightweight Charts 由锁定的本地 npm 包随生产资源打包，不使用 iframe，不加载 TradingView 或其他第三方远程脚本，也没有引入自动交易 SDK。

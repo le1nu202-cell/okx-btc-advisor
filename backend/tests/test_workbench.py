@@ -130,14 +130,15 @@ def test_state_machine_allows_only_one_add_and_persists_events(tmp_path):
     record = make_plan_record(plan())
     initial, _ = apply_action(record, TradeActionRequest(action=TradeAction.CONFIRM_INITIAL, price=100, quantity_btc=0.4))
     near, event, _ = price_trigger(initial, 90, True)
-    assert near["state"] == TradeState.APPROACHING_ADD and event == "APPROACHING_ADD"
+    assert near["state"] == TradeState.INITIAL_OPEN and event == "APPROACHING_ADD"
+    assert near["activeReminder"]["type"] == "APPROACHING_ADD"
     added, _ = apply_action(near, TradeActionRequest(action=TradeAction.CONFIRM_ADD, price=90, quantity_btc=0.8))
     assert added["addCount"] == 1 and added["state"] == TradeState.ADDED
     with pytest.raises(ValueError, match="最多只允许一次"):
         apply_action({**added, "state": TradeState.APPROACHING_ADD.value}, TradeActionRequest(action=TradeAction.CONFIRM_ADD, price=89, quantity_btc=0.8))
     db = Database(tmp_path / "state.db")
     db.save_trade_plan(added)
-    db.save_trade_plan_event(added["id"], TradeState.APPROACHING_ADD.value, TradeState.ADDED.value, "CONFIRM_ADD", 90)
+    db.save_trade_plan_event(added["id"], TradeState.INITIAL_OPEN.value, TradeState.ADDED.value, "CONFIRM_ADD", 90)
     restored = db.get_active_trade_plan()
     assert restored["state"] == TradeState.ADDED and restored["addCount"] == 1
     assert db.trade_plan_events(added["id"])[0]["eventType"] == "CONFIRM_ADD"
@@ -220,6 +221,8 @@ def test_confirmations_require_price_and_quantity_and_terminal_blocks_more_actio
     opened, _ = apply_action(record, TradeActionRequest(
         action=TradeAction.CONFIRM_INITIAL, price=100, quantity_btc=0.4,
     ))
+    assert opened["actualFills"]["initial"]["confirmedAt"] == opened["updatedAt"]
+    assert recompute_execution(opened)["actualFills"]["initial"]["confirmedAt"] == opened["updatedAt"]
     closed, _ = apply_action(opened, TradeActionRequest(
         action=TradeAction.CONFIRM_STOP, price=80, quantity_btc=0.4,
     ))
@@ -240,6 +243,20 @@ def test_market_triggers_only_persist_reminders_and_stale_data_does_nothing():
     opened, _ = apply_action(planned, TradeActionRequest(
         action=TradeAction.CONFIRM_INITIAL, price=100, quantity_btc=0.4,
     ))
+    approaching_add, event, message = price_trigger(opened, 90, True)
+    assert approaching_add["state"] == TradeState.INITIAL_OPEN
+    assert event == "APPROACHING_ADD" and "不会自动加仓" in message
+    assert approaching_add["actualFills"] == opened["actualFills"]
+
+    added, _ = apply_action(approaching_add, TradeActionRequest(
+        action=TradeAction.CONFIRM_ADD, price=90, quantity_btc=0.8,
+    ))
+    reduce_price = float(added["risk"]["reduceZonePrice"])
+    reduce_zone, event, message = price_trigger(added, reduce_price, True)
+    assert reduce_zone["state"] == TradeState.ADDED
+    assert event == "REDUCE_ZONE" and "人工确认" in message
+    assert reduce_zone["actualFills"] == added["actualFills"]
+
     stopped, event, message = price_trigger(opened, 79, True)
     assert stopped["state"] == TradeState.INITIAL_OPEN
     assert event == "STOP_HIT_PENDING_CONFIRMATION" and "人工确认" in message

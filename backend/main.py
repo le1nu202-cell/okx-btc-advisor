@@ -43,6 +43,7 @@ from .workbench import (
     candle_mark_to_market,
     make_plan_record,
     new_id,
+    normalize_live_execution_state,
     now_ms,
     price_trigger,
     recompute_execution,
@@ -267,8 +268,9 @@ async def evaluate_active_plan_price(price:float|None) -> None:
     alert=None
     try:
         with trade_plan_lock:
-            record=db.get_active_trade_plan()
-            if not record:return
+            stored_record=db.get_active_trade_plan()
+            if not stored_record:return
+            record=normalize_live_execution_state(stored_record)
             state=TradeState(record["state"])
             if state in TERMINAL_STATES:return
             fresh,_=_live_market_ready(now)
@@ -280,7 +282,7 @@ async def evaluate_active_plan_price(price:float|None) -> None:
                 favorable,adverse=candle_mark_to_market(updated,mark)
                 updated["mfeUsdt"]=max(float(updated.get("mfeUsdt") or 0),favorable)
                 updated["maeUsdt"]=max(float(updated.get("maeUsdt") or 0),adverse)
-            changed=updated!=record
+            changed=record!=stored_record or updated!=record
             if changed:db.save_trade_plan(updated,active=True)
             if event:
                 db.save_trade_plan_event(updated["id"],before_state,updated["state"],event,float(price),{"message":message})
@@ -603,6 +605,7 @@ def trade_plan_current():
     with trade_plan_lock:
         value=db.get_active_trade_plan()
         if value:
+            value=normalize_live_execution_state(value)
             value=recompute_execution(value)
             db.save_trade_plan(value,active=True)
             return value
@@ -644,6 +647,7 @@ def trade_plan_action(plan_id:str,value:TradeActionRequest):
     with trade_plan_lock:
         record=db.get_trade_plan(plan_id)
         if not record:raise HTTPException(404,"交易计划不存在")
+        record=normalize_live_execution_state(record)
         before=record["state"]
         try:updated,target=apply_action(record,value)
         except ValueError as exc:raise HTTPException(409,str(exc)) from exc

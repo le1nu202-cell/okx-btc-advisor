@@ -87,7 +87,12 @@ export interface RiskCalculation {
   assumptions: string[]
 }
 
-export interface ActualFill { price: number; quantityBtc: number }
+export interface ActualFill {
+  price: number
+  quantityBtc: number
+  /** 成交确认时间；旧 SQLite JSON 记录可能没有该字段。 */
+  confirmedAt?: number
+}
 export type ActualFillKey = 'initial' | 'add' | 'reduce' | 'exit'
 
 export interface ExecutionSummary {

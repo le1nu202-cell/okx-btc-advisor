@@ -178,6 +178,10 @@ def test_live_price_stop_only_creates_pending_reminder_and_never_log(tmp_path, m
     assert restored["activeReminder"]["type"] == "STOP_HIT_PENDING_CONFIRMATION"
     assert "exit" not in restored["actualFills"] and "logId" not in restored
     assert local.trade_logs("live") == []
+    events = local.trade_plan_events(opened["id"])
+    assert len(events) == 1
+    assert events[0]["eventType"] == "STOP_HIT_PENDING_CONFIRMATION"
+    assert events[0]["fromState"] == events[0]["toState"] == "INITIAL_OPEN"
 
 
 def test_planned_update_clears_stale_price_reminder(tmp_path, monkeypatch):
@@ -200,6 +204,95 @@ def test_planned_update_clears_stale_price_reminder(tmp_path, monkeypatch):
     assert response.status_code == 200
     assert "activeReminder" not in response.json()
     assert "activeReminder" not in local.get_trade_plan(record["id"])
+
+
+def test_legacy_approaching_add_is_lazily_normalized_and_can_continue(tmp_path, monkeypatch):
+    database_path = tmp_path / "legacy-approaching-add.db"
+    local = Database(database_path)
+    monkeypatch.setattr(main, "db", local)
+    record = main.make_plan_record(main.TradePlanDraft.model_validate(BASE_PLAN))
+    quantity = record["risk"]["initialQuantityBtc"]
+    opened, _ = main.apply_action(
+        record,
+        main.TradeActionRequest(action="CONFIRM_INITIAL", price=100, quantity_btc=quantity),
+    )
+    legacy_updated_at = opened["updatedAt"]
+    opened["state"] = "APPROACHING_ADD"
+    opened["activeReminder"] = {
+        "type": "APPROACHING_ADD",
+        "message": "legacy reminder",
+        "price": 90,
+        "createdAt": 1,
+        "at": 1,
+    }
+    local.save_trade_plan(opened, active=True)
+    reopened = Database(database_path)
+    monkeypatch.setattr(main, "db", reopened)
+
+    with TestClient(main.app) as client:
+        restored = client.get("/api/trade-plans/current")
+        assert restored.status_code == 200
+        body = restored.json()
+        assert body["state"] == "INITIAL_OPEN"
+        assert body["activeReminder"]["type"] == "APPROACHING_ADD"
+        assert body["updatedAt"] == legacy_updated_at
+        assert reopened.get_active_trade_plan()["state"] == "INITIAL_OPEN"
+        assert reopened.trade_plan_events(opened["id"]) == []
+
+        add_quantity = body["risk"]["addQuantityBtc"]
+        added = client.post(
+            f"/api/trade-plans/{opened['id']}/actions",
+            json={"action": "CONFIRM_ADD", "price": 90, "quantityBtc": add_quantity},
+        )
+        assert added.status_code == 200
+        assert added.json()["plan"]["state"] == "ADDED"
+        assert "activeReminder" not in added.json()["plan"]
+
+    event = reopened.trade_plan_events(opened["id"])[0]
+    assert event["fromState"] == "INITIAL_OPEN" and event["toState"] == "ADDED"
+
+
+def test_legacy_reduce_zone_action_normalizes_without_prior_read(tmp_path, monkeypatch):
+    local = Database(tmp_path / "legacy-reduce-zone.db")
+    monkeypatch.setattr(main, "db", local)
+    record = main.make_plan_record(main.TradePlanDraft.model_validate(BASE_PLAN))
+    initial_quantity = record["risk"]["initialQuantityBtc"]
+    add_quantity = record["risk"]["addQuantityBtc"]
+    opened, _ = main.apply_action(
+        record,
+        main.TradeActionRequest(action="CONFIRM_INITIAL", price=100, quantity_btc=initial_quantity),
+    )
+    added, _ = main.apply_action(
+        opened,
+        main.TradeActionRequest(action="CONFIRM_ADD", price=90, quantity_btc=add_quantity),
+    )
+    added["state"] = "REDUCE_ZONE"
+    added["activeReminder"] = {
+        "type": "REDUCE_ZONE",
+        "message": "legacy reminder",
+        "price": added["risk"]["reduceZonePrice"],
+        "createdAt": 1,
+        "at": 1,
+    }
+    local.save_trade_plan(added, active=True)
+
+    with TestClient(main.app) as client:
+        reduced = client.post(
+            f"/api/trade-plans/{added['id']}/actions",
+            json={
+                "action": "CONFIRM_REDUCE",
+                "price": added["risk"]["reduceZonePrice"],
+                "quantityBtc": add_quantity,
+            },
+        )
+
+    assert reduced.status_code == 200
+    plan = reduced.json()["plan"]
+    assert plan["state"] == "PARTIALLY_REDUCED"
+    assert set(plan["actualFills"]) == {"initial", "add", "reduce"}
+    assert "activeReminder" not in plan
+    event = local.trade_plan_events(added["id"])[0]
+    assert event["fromState"] == "ADDED" and event["toState"] == "PARTIALLY_REDUCED"
 
 
 def test_concurrent_terminal_confirm_is_idempotent_and_creates_one_live_log(tmp_path, monkeypatch):

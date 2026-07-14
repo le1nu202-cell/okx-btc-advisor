@@ -1,11 +1,12 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { FormEvent } from 'react'
-import { AlertOctagon, AlertTriangle, Calculator, CheckCircle2, CircleDollarSign, LoaderCircle, RefreshCw, Save, ShieldAlert, Wifi, WifiOff } from 'lucide-react'
+import { AlertOctagon, AlertTriangle, Calculator, CheckCircle2, LoaderCircle, RefreshCw, Save, ShieldAlert, Wifi, WifiOff } from 'lucide-react'
+import TradingPlanChart from './components/TradingPlanChart'
 import { workbenchApi } from './workbench-api'
-import { ACTION_LABELS, LEGAL_ACTIONS, STATE_LABELS, isTerminalState, prefillForAction, priceOrderError, toInputNumber } from './workbench-utils'
+import { ACTION_LABELS, STATE_LABELS, canonicalExecutionState, isTerminalState, legalActionsForState, prefillForAction, priceOrderError, toInputNumber } from './workbench-utils'
 import { DEFAULT_PLAN } from './workbench-types'
-import type { ActiveReminder, ExecutionRisk, FillAction, RiskCalculation, TradeAction, TradePlanDraft, TradePlanRecord } from './workbench-types'
-import type { Candle, MarketSnapshot } from './types'
+import type { ActiveReminder, ExecutionRisk, FillAction, RiskCalculation, TradePlanDraft, TradePlanRecord } from './workbench-types'
+import type { MarketSnapshot } from './types'
 
 const EMPTY_SNAPSHOT: MarketSnapshot = { instrument: 'BTC-USDT-SWAP', price: null, updatedAt: null, stale: true, connectionStatus: 'disconnected', fundingRate: null, fundingTime: null, openInterest: null, openInterestTime: null, candles1h: [], candles4h: [] }
 const EMPTY_RECORD: TradePlanRecord = { id: null, state: 'IDLE', plan: null, risk: null, actualFills: {}, activeReminder: null }
@@ -25,41 +26,10 @@ function NumberField({ label, value, onChange, step = 'any', min = 0, disabled =
   return <label className="wb-field"><span>{label}</span><div><input type="number" min={min} step={step} value={value ?? ''} disabled={disabled} required={required} onChange={event => onChange(toInputNumber(event.target.value))}/>{suffix && <em>{suffix}</em>}</div></label>
 }
 
-function PlanChart({ candles, plan, risk, executionRisk }: { candles: Candle[]; plan: TradePlanDraft; risk: RiskCalculation | null; executionRisk?: ExecutionRisk | null }) {
-  const data = candles.slice(-72)
-  const actualAverageEntryPrice = executionRisk?.averageEntryPrice
-  const fullCost = executionRisk?.fullCostBreakevenPrice ?? risk?.fullCostBreakevenPrice ?? risk?.allInBreakevenPrice ?? risk?.feeAdjustedBreakevenPrice
-  const lines = [
-    { label: '初始开仓', value: plan.initialEntryPrice, color: '#49e7ac' },
-    { label: '第一压力 / 加仓', value: plan.addPrice, color: '#f3b64a' },
-    { label: '第二压力 / 止损', value: plan.stopPrice, color: '#ff627d' },
-    { label: '止盈', value: plan.takeProfitPrice, color: '#56a8ff' },
-    { label: actualAverageEntryPrice != null ? '实际加权均价' : '加仓后加权均价', value: actualAverageEntryPrice ?? risk?.averageEntryPrice, color: '#c38cff' },
-    { label: '全成本保本价', value: fullCost, color: '#f6ef91' },
-  ].filter((row): row is { label: string; value: number; color: string } => row.value != null && Number.isFinite(row.value))
-  const priceValues = [...data.flatMap(row => [row.low, row.high]), ...lines.map(row => row.value)]
-  if (!priceValues.length) return <div className="wb-chart-empty">填写四价后，六条计划价格线会同步显示在 1H 图表上。</div>
-  const W = 920, H = 380, chartRight = 675, top = 18, bottom = 28
-  const rawMin = Math.min(...priceValues), rawMax = Math.max(...priceValues), padding = Math.max((rawMax - rawMin) * .08, rawMax * .001)
-  const min = rawMin - padding, max = rawMax + padding, spread = max - min || 1
-  const y = (value: number) => top + (max - value) / spread * (H - top - bottom)
-  const x = (index: number) => data.length <= 1 ? chartRight / 2 : index / (data.length - 1) * chartRight
-  return <div className="wb-chart-wrap">
-    <div className="wb-chart-caption"><span>1H 已收盘 K 线</span><span>价格线随表单与风险计算同步 · 本轮不支持拖动</span></div>
-    <svg className="wb-plan-chart" viewBox={`0 0 ${W} ${H}`} role="img" aria-label="1H K 线与初始、加仓、止损、止盈、加权均价、全成本保本六条价格线">
-      {[0, .25, .5, .75, 1].map(part => <line key={part} x1="0" x2={chartRight} y1={top + part * (H - top - bottom)} y2={top + part * (H - top - bottom)} className="wb-gridline"/>)}
-      {data.map((row, index) => {
-        const rising = row.close >= row.open, candleX = x(index), bodyTop = y(Math.max(row.open, row.close)), bodyHeight = Math.max(1.5, Math.abs(y(row.open) - y(row.close)))
-        return <g key={row.timestamp}><line x1={candleX} x2={candleX} y1={y(row.high)} y2={y(row.low)} stroke={rising ? '#49e7ac' : '#ff627d'} opacity=".75"/><rect x={candleX - 2.2} y={bodyTop} width="4.4" height={bodyHeight} fill={rising ? '#49e7ac' : '#ff627d'}/></g>
-      })}
-      {lines.map((row, index) => <g key={row.label}><line x1="0" x2={chartRight} y1={y(row.value)} y2={y(row.value)} stroke={row.color} strokeWidth="1.5" strokeDasharray={index < 4 ? '0' : '6 4'}/><circle cx={chartRight + 10} cy={y(row.value)} r="3.5" fill={row.color}/><text x={chartRight + 20} y={y(row.value) + 4} fill={row.color}>{row.label} · {money(row.value)}</text></g>)}
-    </svg>
-  </div>
-}
-
 function PlanForm({ draft, setDraft, record, risk, saving, onSave }: { draft: TradePlanDraft; setDraft: (plan: TradePlanDraft) => void; record: TradePlanRecord; risk: RiskCalculation | null; saving: boolean; onSave: (event: FormEvent) => void }) {
-  const terminal = isTerminalState(record.state)
-  const editable = !record.id || record.state === 'PLANNED' || terminal
+  const executionState = canonicalExecutionState(record.state)
+  const terminal = isTerminalState(executionState)
+  const editable = !record.id || executionState === 'PLANNED' || terminal
   const orderError = priceOrderError(draft)
   const set = <K extends keyof TradePlanDraft>(key: K, value: TradePlanDraft[K]) => setDraft({ ...draft, [key]: value })
   const marginInputMode = draft.initialMargin == null ? 'PERCENT' : 'AMOUNT'
@@ -91,31 +61,49 @@ function PlanForm({ draft, setDraft, record, risk, saving, onSave }: { draft: Tr
       </div>
       {orderError && <div className="wb-inline-error" role="alert"><AlertTriangle/>{orderError}</div>}
       {risk?.errors.map(error => <div className="wb-inline-error" role="alert" key={error}><AlertTriangle/>{error}</div>)}
-      {editable && <button className="wb-primary" type="submit" disabled={saving || Boolean(orderError) || risk?.valid === false}>{saving ? <LoaderCircle className="spin"/> : <Save/>}{record.id && record.state === 'PLANNED' ? '更新当前计划' : terminal ? '创建下一笔计划' : '创建交易计划'}</button>}
+      {editable && <button className="wb-primary" type="submit" disabled={saving || Boolean(orderError) || risk?.valid === false}>{saving ? <LoaderCircle className="spin"/> : <Save/>}{record.id && executionState === 'PLANNED' ? '更新当前计划' : terminal ? '创建下一笔计划' : '创建交易计划'}</button>}
     </form>
   </section>
 }
 
-function RiskDetails({ risk, plan, executionRisk }: { risk: RiskCalculation | null; plan: TradePlanDraft; executionRisk?: ExecutionRisk | null }) {
+function RiskDetails({ risk, plan, executionRisk, record }: { risk: RiskCalculation | null; plan: TradePlanDraft; executionRisk?: ExecutionRisk | null; record: TradePlanRecord }) {
   if (!risk) return <section className="wb-panel wb-risk-details"><div className="wb-section-head"><div><span className="wb-kicker">加仓后风险详情</span><h2>等待风险计算</h2></div></div><div className="wb-chart-empty"><Calculator/>填写四价后由后端统一计算。</div></section>
-  const actualAverageEntryPrice = executionRisk?.averageEntryPrice
-  const fullCost = executionRisk?.fullCostBreakevenPrice ?? risk.fullCostBreakevenPrice ?? risk.allInBreakevenPrice ?? risk.feeAdjustedBreakevenPrice
-  const rows = [
+  const plannedFullCost = risk.fullCostBreakevenPrice ?? risk.allInBreakevenPrice ?? risk.feeAdjustedBreakevenPrice
+  const plannedRows: Array<[string, string]> = [
     ['初始保证金', `${money(risk.initialMargin)} USDT`], ['加仓保证金', `${money(risk.addMargin)} USDT`], ['总使用保证金', `${money(risk.totalMargin)} USDT`],
     ['初始名义仓位', `${money(risk.initialNotional)} USDT`], ['加仓名义仓位', `${money(risk.addNotional)} USDT`], ['总名义仓位', `${money(risk.totalNotional)} USDT`],
-    ['初始 BTC 数量', `${quantity(risk.initialQuantityBtc)} BTC`], ['加仓 BTC 数量', `${quantity(risk.addQuantityBtc)} BTC`], [executionRisk ? '实际剩余 BTC 数量' : '总 BTC 数量', `${quantity(executionRisk?.quantityBtc ?? risk.totalQuantityBtc)} BTC`],
-    ['计划减仓后剩余', `${quantity(risk.remainingQuantityAfterPlannedReduce)} BTC`], [actualAverageEntryPrice != null ? '实际加权均价' : '加仓后加权均价', `${money(actualAverageEntryPrice ?? risk.averageEntryPrice)} USDT`], [executionRisk ? '实际毛保本价' : '毛保本价', `${money(executionRisk?.grossBreakevenPrice ?? risk.grossBreakevenPrice)} USDT`],
-    [executionRisk ? '实际手续费保本价' : '手续费保本价', `${money(executionRisk?.feeBreakevenPrice ?? risk.feeBreakevenPrice)} USDT`], [executionRisk ? '实际全成本保本价' : '全成本保本价', `${money(fullCost)} USDT`], ['止盈位毛利润', `${money(risk.grossProfitAtTakeProfit)} USDT`],
-    ['止盈位预计净利润', `${money(risk.netProfitAtTakeProfit)} USDT`], ['止损位毛亏损', `${money(risk.grossLossAtStop)} USDT`], [executionRisk ? '整笔交易止损净亏损' : '止损位预计净亏损', `${money(executionRisk?.netLossAtStop ?? risk.netLossAtStop)} USDT`],
-    ...(executionRisk?.remainingNetLossAtStop != null ? [['仅剩余仓位止损净亏损', `${money(executionRisk.remainingNetLossAtStop)} USDT`]] : []),
+    ['计划初始 BTC 数量', `${quantity(risk.initialQuantityBtc)} BTC`], ['计划加仓 BTC 数量', `${quantity(risk.addQuantityBtc)} BTC`], ['计划总 BTC 数量', `${quantity(risk.totalQuantityBtc)} BTC`],
+    ['计划减仓后剩余', `${quantity(risk.remainingQuantityAfterPlannedReduce)} BTC`], ['计划加权均价', `${money(risk.averageEntryPrice)} USDT`], ['计划毛保本价', `${money(risk.grossBreakevenPrice)} USDT`],
+    ['计划手续费保本价', `${money(risk.feeBreakevenPrice)} USDT`], ['计划全成本保本价', `${money(plannedFullCost)} USDT`], ['止盈位毛利润', `${money(risk.grossProfitAtTakeProfit)} USDT`],
+    ['止盈位预计净利润', `${money(risk.netProfitAtTakeProfit)} USDT`], ['止损位毛亏损', `${money(risk.grossLossAtStop)} USDT`], ['计划止损净亏损', `${money(risk.netLossAtStop)} USDT`],
     ['开仓手续费', `${money(risk.openingFee)} USDT`], ['加仓手续费', `${money(risk.addFee)} USDT`], ['减仓手续费', `${money(risk.estimatedReduceFee)} USDT`],
     ['最终平仓手续费', `${money(risk.estimatedCloseFee)} USDT`], ['止损总手续费', `${money(risk.totalFeesAtStop)} USDT`], ['止损预计滑点', `${money(risk.estimatedSlippageAtStop)} USDT`],
     ['止盈预计滑点', `${money(risk.estimatedSlippageAtTakeProfit)} USDT`], ['盈亏比', risk.riskRewardRatio == null ? '—' : `1 : ${risk.riskRewardRatio.toFixed(2)}`], ['反推最大初始保证金', `${money(risk.maxInitialMarginByLoss)} USDT`],
-    ...(executionRisk ? [['若现在止损整笔总净盈亏', `${money(executionRisk.totalNetPnlIfStopped)} USDT`]] : []),
   ]
+  const execution = record.executionSummary ?? record.execution
+  const fills = record.actualFills ?? {}
+  const actualRows: Array<[string, string]> = execution && executionRisk ? [
+    ['实际初始成交数量', `${quantity(fills.initial?.quantityBtc)} BTC`],
+    ['实际加仓成交数量', `${quantity(fills.add?.quantityBtc)} BTC`],
+    ['实际累计开仓数量', `${quantity(execution.openedQuantityBtc)} BTC`],
+    ['实际剩余数量', `${quantity(execution.remainingQuantityBtc)} BTC`],
+    ['实际加权均价', `${money(executionRisk.averageEntryPrice)} USDT`],
+    ['实际毛保本价', `${money(executionRisk.grossBreakevenPrice)} USDT`],
+    ['实际手续费保本价', `${money(executionRisk.feeBreakevenPrice)} USDT`],
+    ['实际全成本保本价', `${money(executionRisk.fullCostBreakevenPrice)} USDT`],
+    ['实际剩余仓位到止损净亏损', `${money(executionRisk.remainingNetLossAtStop)} USDT`],
+    ['实际到止损总盈亏', `${money(executionRisk.totalNetPnlIfStopped)} USDT`],
+    ['实际止损风险占权益', percent(executionRisk.maxLossEquityPercent)],
+    ['实际已实现净盈亏', `${money(execution.realizedNetPnl)} USDT`],
+  ] : []
   return <section className="wb-panel wb-risk-details">
-    <div className="wb-section-head"><div><span className="wb-kicker">加仓后风险详情</span><h2>保证金、名义仓位、BTC 数量与交易成本</h2></div><span className="wb-risk-pill">{executionRisk ? `实际风险：${actualRiskLevel(executionRisk.maxLossEquityPercent, plan)}` : risk.riskLevel}</span></div>
-    <div className="wb-risk-grid">{rows.map(([label, value]) => <Metric key={label} label={label} value={value}/>)}</div>
+    <div className="wb-section-head"><div><span className="wb-kicker">风险详情</span><h2>计划数据与实际成交数据严格分区</h2></div><span className="wb-risk-pill">{executionRisk ? `实际风险：${actualRiskLevel(executionRisk.maxLossEquityPercent, plan)}` : `计划风险：${risk.riskLevel}`}</span></div>
+    <div className="wb-risk-subhead"><strong>计划数据</strong><span>由保存的计划和后端风险计算返回</span></div>
+    <div className="wb-risk-grid">{plannedRows.map(([label, value]) => <Metric key={label} label={label} value={value}/>)}</div>
+    {actualRows.length > 0 && <div className="wb-actual-risk-block">
+      <div className="wb-risk-subhead actual"><strong>实际成交数据</strong><span>仅由人工确认的 actualFills 和后端 executionRisk 返回</span></div>
+      <div className="wb-risk-grid actual">{actualRows.map(([label, value]) => <Metric key={label} label={label} value={value}/>)}</div>
+    </div>}
     <div className="wb-adverse"><strong>加仓后继续反向移动</strong>{risk.adverseMoveLosses.map(row => <span key={row.movePercent}>反向 {row.movePercent}%：预计亏损 {money(row.lossUsdt)} USDT（权益 {percent(row.equityPercent)}）</span>)}</div>
     {[...risk.warnings, ...(risk.liquidationWarning ? ['当前计划存在强平风险提示，请缩小仓位或调整止损。'] : []), ...(risk.lossLimitExceeded ? [`预计亏损超过你设定的 ${money(plan.maxLossUsdt)} USDT 上限。`] : [])].map(message => <div className="wb-warning" key={message}><AlertTriangle/>{message}</div>)}
   </section>
@@ -134,15 +122,16 @@ function ExecutionPanel({ record }: { record: TradePlanRecord }) {
 }
 
 function ActionsPanel({ record, onChanged }: { record: TradePlanRecord; onChanged: (record: TradePlanRecord, message: string) => void }) {
-  const legal = LEGAL_ACTIONS[record.state]
+  const executionState = canonicalExecutionState(record.state)
+  const legal = legalActionsForState(executionState)
   const fillActions = legal.filter((action): action is FillAction => action !== 'CANCEL')
   const [selected, setSelected] = useState<FillAction | null>(fillActions[0] ?? null)
   const [price, setPrice] = useState<number | null>(null), [quantityBtc, setQuantity] = useState<number | null>(null), [note, setNote] = useState('')
   const [submitting, setSubmitting] = useState(false), [error, setError] = useState('')
-  useEffect(() => { const next = fillActions[0] ?? null; setSelected(next) }, [record.state])
-  useEffect(() => { if (!selected || !record.plan) return; const values = prefillForAction(selected, record.plan, record.risk, record); setPrice(values.price || null); setQuantity(values.quantityBtc || null); setError('') }, [selected, record.id, record.state])
+  useEffect(() => { const next = fillActions[0] ?? null; setSelected(next) }, [executionState])
+  useEffect(() => { if (!selected || !record.plan) return; const values = prefillForAction(selected, record.plan, record.risk, record); setPrice(values.price || null); setQuantity(values.quantityBtc || null); setError('') }, [selected, record.id, executionState])
   if (!record.id) return <section className="wb-panel wb-actions"><div className="wb-section-head"><div><span className="wb-kicker">当前可执行动作</span><h2>先创建计划</h2></div></div><div className="wb-empty-small">创建计划后，这里只会显示当前阶段允许的人工确认动作。</div></section>
-  if (isTerminalState(record.state)) return <section className="wb-panel wb-actions"><div className="wb-section-head"><div><span className="wb-kicker">当前可执行动作</span><h2>本计划已结束</h2></div></div><div className="wb-terminal"><CheckCircle2/>终态不再允许加仓或减仓。可在上方修改四价并创建下一笔计划。</div></section>
+  if (isTerminalState(executionState)) return <section className="wb-panel wb-actions"><div className="wb-section-head"><div><span className="wb-kicker">当前可执行动作</span><h2>本计划已结束</h2></div></div><div className="wb-terminal"><CheckCircle2/>终态不再允许加仓或减仓。可在上方修改四价并创建下一笔计划。</div></section>
   const submit = async (event: FormEvent) => {
     event.preventDefault()
     if (!selected || !record.id || price == null || price <= 0 || quantityBtc == null || quantityBtc <= 0) return setError('实际成交价格和实际 BTC 数量都必须大于 0。')
@@ -174,7 +163,7 @@ function ActionsPanel({ record, onChanged }: { record: TradePlanRecord; onChange
 
 function ReminderPanel({ reminder }: { reminder: ActiveReminder | null | undefined }) {
   return <section className={`wb-panel wb-reminder ${reminder ? 'active' : ''}`}>
-    <div className="wb-section-head"><div><span className="wb-kicker">行情提醒</span><h2>{reminder ? '需要你检查并决定是否操作' : '当前没有待处理提醒'}</h2></div><span className="wb-not-fill"><AlertOctagon/>提醒不是成交</span></div>
+    <div className="wb-section-head"><div><span className="wb-kicker">当前行情提醒</span><h2>{reminder ? '需要你检查并决定是否操作' : '当前没有待处理提醒'}</h2></div><span className="wb-not-fill"><AlertOctagon/>提醒不是成交</span></div>
     {reminder ? <div className="wb-reminder-body"><strong>{reminder.message}</strong><span>触发参考价 {money(reminder.price)} USDT · {time(reminder.createdAt)}</span><p>行情触及价格只会显示提醒，不会改变真实成交状态、不会写入 actualFills，也不会创建最终交易日志。</p></div> : <div className="wb-empty-small">系统会在接近开仓、加仓、减仓、止盈或止损区域时提醒；仍需你在上方手工确认实际价格和 BTC 数量。</div>}
   </section>
 }
@@ -187,8 +176,9 @@ export default function WorkbenchView() {
   const didRestore = useRef(false), latestDraft = useRef(draft)
   latestDraft.current = draft
   const applyRecord = useCallback((next: TradePlanRecord, restoreDraft = false) => {
-    setRecord(next); if (next.risk) setRisk(next.risk)
-    if (next.plan && (restoreDraft || next.state === 'PLANNED')) setDraft(next.plan)
+    const normalized = { ...next, state: canonicalExecutionState(next.state) }
+    setRecord(normalized); if (normalized.risk) setRisk(normalized.risk)
+    if (normalized.plan && (restoreDraft || normalized.state === 'PLANNED')) setDraft(normalized.plan)
   }, [])
   const load = useCallback(async () => {
     const results = await Promise.allSettled([workbenchApi.snapshot(), workbenchApi.current()])
@@ -235,39 +225,43 @@ export default function WorkbenchView() {
     if (localError) return setCalculationError(localError)
     setSaving(true); setServiceError('')
     try {
-      const next = record.id && record.state === 'PLANNED' ? await workbenchApi.update(record.id, draft) : await workbenchApi.create(draft)
-      applyRecord(next, true); setToast(record.id && record.state === 'PLANNED' ? '计划已更新' : '计划已创建，等待你确认真实开仓')
+      const executionState = canonicalExecutionState(record.state)
+      const next = record.id && executionState === 'PLANNED' ? await workbenchApi.update(record.id, draft) : await workbenchApi.create(draft)
+      applyRecord(next, true); setToast(record.id && executionState === 'PLANNED' ? '计划已更新' : '计划已创建，等待你确认真实开仓')
     } catch (reason) { setServiceError(reason instanceof Error ? reason.message : '保存计划失败') }
     finally { setSaving(false) }
   }
-  const currentRisk = record.id && record.state !== 'PLANNED' && !isTerminalState(record.state) ? record.risk : risk
+  const executionState = canonicalExecutionState(record.state)
+  const startingNextPlan = Boolean(record.id && isTerminalState(executionState) && record.plan && JSON.stringify(draft) !== JSON.stringify(record.plan))
+  const currentRisk = record.id && executionState !== 'PLANNED' && !isTerminalState(executionState) ? record.risk : risk
   const hasActualFills = Object.keys(record.actualFills ?? {}).length > 0
-  const executionRisk = hasActualFills ? record.executionRisk : null
+  const executionRisk: ExecutionRisk | null = hasActualFills && !startingNextPlan ? record.executionRisk ?? null : null
   const direction = record.plan?.direction ?? draft.direction
   const equityPercent = executionRisk?.maxLossEquityPercent ?? currentRisk?.maxLossEquityPercent
   const netLoss = Math.abs(executionRisk?.netLossAtStop ?? currentRisk?.netLossAtStop ?? 0)
   const age = snapshot.updatedAt == null ? '尚无行情时间' : `${Math.max(0, Math.round((Date.now() - snapshot.updatedAt) / 1000))} 秒前`
   const marketConnected = socketConnected && snapshot.connectionStatus === 'connected' && !snapshot.stale
-  const chartPlan = record.id && record.state !== 'PLANNED' && !isTerminalState(record.state) && record.plan ? record.plan : draft
+  const chartPlan = record.id && executionState !== 'PLANNED' && (!isTerminalState(executionState) || !startingNextPlan) && record.plan ? record.plan : draft
+  const chartActualFills = startingNextPlan ? {} : record.actualFills ?? {}
   const riskTone = currentRisk?.lossLimitExceeded || currentRisk?.liquidationWarning || (chartPlan.maxLossUsdt != null && netLoss > chartPlan.maxLossUsdt) ? 'danger' : 'normal'
   const updateAfterAction = (next: TradePlanRecord, message: string) => { applyRecord(next, true); setToast(message) }
-  const primaryStatus = useMemo(() => STATE_LABELS[record.state], [record.state])
+  const primaryStatus = useMemo(() => STATE_LABELS[executionState], [executionState])
   return <main className="workbench-page">
     {serviceError && <div className="wb-service-error" role="alert"><AlertTriangle/><span>{serviceError}</span><button onClick={load}>重试</button></div>}
     <section className="wb-market-status">
       <div className="wb-price"><span>{snapshot.instrument}</span><strong>{snapshot.price == null ? '—' : `$${money(snapshot.price)}`}</strong><small>{age}</small></div>
       <div className={`wb-connection ${marketConnected ? 'online' : ''}`}>{marketConnected ? <Wifi/> : <WifiOff/>}<span><strong>{connectionLabel(snapshot.connectionStatus)}</strong><small>{socketConnected ? '本地实时通道已连接' : '本地实时通道重连中'}</small></span></div>
-      <div className="wb-state"><span>真实交易状态</span><strong>{primaryStatus}</strong><small>{direction === 'LONG' ? '当前计划：做多' : '当前计划：做空'} · 状态只由人工确认改变</small></div>
+      <div className="wb-state"><span>实际执行状态</span><strong>{primaryStatus}</strong><small>{direction === 'LONG' ? '当前计划：做多' : '当前计划：做空'} · 只由人工成交确认改变</small></div>
       <button className="wb-refresh" aria-label="刷新行情和当前计划" onClick={load} disabled={loading}><RefreshCw className={loading ? 'spin' : ''}/></button>
     </section>
     <section className={`wb-risk-hero ${riskTone}`}>
-      <div><span>最重要的风险数字</span><h1>到第二压力位预计净亏损 <strong>{currentRisk?.valid ? money(netLoss) : '—'} USDT</strong></h1><p>这是手续费和预计滑点后的估算，不是“使用 4% 保证金就只承担 4% 风险”。</p></div>
+      <div><span>最重要的风险数字</span><h1>{executionRisk ? '实际仓位到第二压力位整笔预计净亏损' : '计划到第二压力位预计净亏损'} <strong>{currentRisk?.valid ? money(netLoss) : '—'} USDT</strong></h1><p>这是手续费和预计滑点后的估算，不是“使用 4% 保证金就只承担 4% 风险”。</p></div>
       <div className="wb-risk-hero-side"><Metric label="占账户权益" value={percent(equityPercent)}/><Metric label="风险等级" value={executionRisk ? actualRiskLevel(equityPercent, chartPlan) : currentRisk?.riskLevel ?? '等待计算'}/><Metric label="最大允许亏损" value={`${money(chartPlan.maxLossUsdt)} USDT`}/><Metric label="反推最大初始保证金" value={`${money(currentRisk?.maxInitialMarginByLoss)} USDT`}/></div>
     </section>
     {calculationError && <div className="wb-inline-error wb-global-error" role="alert"><AlertTriangle/>{calculationError}</div>}
     <PlanForm draft={draft} setDraft={setDraft} record={record} risk={risk} saving={saving} onSave={save}/>
-    <section className="wb-panel wb-chart-section"><div className="wb-section-head"><div><span className="wb-kicker">1H K 线与计划价格线</span><h2>四价、加权均价和全成本保本价</h2></div><span className="wb-live-label">公共行情 · 只读</span></div><PlanChart candles={snapshot.candles1h} plan={chartPlan} risk={currentRisk} executionRisk={executionRisk}/></section>
-    <RiskDetails risk={currentRisk} plan={chartPlan} executionRisk={executionRisk}/>
+    <section className="wb-panel wb-chart-section"><div className="wb-section-head"><div><span className="wb-kicker">1H / 4H K 线与计划价格线</span><h2>四价、后端加权均价与全成本保本价</h2></div><span className="wb-live-label">公共行情 · 只读</span></div><TradingPlanChart candles1h={snapshot.candles1h} candles4h={snapshot.candles4h} timeframe="1H" currentPrice={snapshot.price} plan={chartPlan} plannedRisk={currentRisk} executionRisk={executionRisk} actualFills={chartActualFills} stale={snapshot.stale} connectionStatus={socketConnected ? snapshot.connectionStatus : 'reconnecting'}/></section>
+    <RiskDetails risk={currentRisk} plan={chartPlan} executionRisk={executionRisk} record={record}/>
     <ActionsPanel record={record} onChanged={updateAfterAction}/>
     <ReminderPanel reminder={record.activeReminder}/>
     <ExecutionPanel record={record}/>

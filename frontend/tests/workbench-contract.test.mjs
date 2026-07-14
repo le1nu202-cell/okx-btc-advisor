@@ -1,19 +1,7 @@
 import assert from 'node:assert/strict'
-import { readFile } from 'node:fs/promises'
 import { test } from 'node:test'
 import { DEFAULT_PLAN } from '../src/workbench-types.ts'
 import { LEGAL_ACTIONS, prefillForAction, priceOrderError } from '../src/workbench-utils.ts'
-
-const source = name => readFile(new URL(`../src/${name}`, import.meta.url), 'utf8')
-
-test('App 默认进入交易工作台并保留研究区入口', async () => {
-  const app = await source('App.tsx')
-  assert.match(app, /useState<View>\('workbench'\)/)
-  assert.match(app, /<WorkbenchView\/>/)
-  assert.match(app, /<ResearchView\/>/)
-  assert.match(app, /交易工作台/)
-  assert.match(app, /研究区/)
-})
 
 test('v0.4 默认参数符合 80U、66x、4%、2 倍和成本约定', () => {
   assert.equal(DEFAULT_PLAN.instrument, 'BTC-USDT-SWAP')
@@ -43,40 +31,9 @@ test('人工确认动作预填价格和 BTC 数量', () => {
   assert.deepEqual(prefillForAction('CONFIRM_STOP', plan, risk, record), { price: 120, quantityBtc: 1.1 })
 })
 
-test('实际 BTC 数量允许后端精确预填值通过浏览器原生校验', async () => {
-  const view = await source('WorkbenchView.tsx')
-  assert.match(view, /label="实际成交 BTC 数量"[^\n]+step="any"/)
-})
-
 test('终态没有加仓减仓动作，部分减仓只允许最终退出', () => {
   assert.deepEqual(LEGAL_ACTIONS.TAKE_PROFIT, [])
   assert.deepEqual(LEGAL_ACTIONS.STOPPED, [])
   assert.deepEqual(LEGAL_ACTIONS.CANCELLED, [])
   assert.deepEqual(LEGAL_ACTIONS.PARTIALLY_REDUCED, ['CONFIRM_TAKE_PROFIT', 'CONFIRM_STOP'])
-})
-
-test('字段和动作 API 与后端冻结契约一致', async () => {
-  const [types, api] = await Promise.all([source('workbench-types.ts'), source('workbench-api.ts')])
-  for (const field of ['fullCostBreakevenPrice', 'totalMargin', 'totalNotional', 'remainingQuantityAfterPlannedReduce', 'feeBreakevenPrice', 'totalFeesAtStop', 'estimatedSlippageAtStop', 'estimatedSlippageAtTakeProfit']) assert.match(types, new RegExp(field))
-  for (const field of ['price: number', 'quantityBtc: number', 'realizedNetPnl', 'remainingQuantityBtc', 'mfeMaeSupported', 'activeReminder', 'realizedSegments', 'executionRisk', 'totalNetPnlIfStopped']) assert.match(types, new RegExp(field))
-  assert.match(api, /action: \(id: string, payload: TradeActionPayload\)/)
-  assert.match(api, /JSON\.stringify\(body\)/)
-})
-
-test('页面醒目显示净亏损并区分提醒与真实成交', async () => {
-  const view = await source('WorkbenchView.tsx')
-  assert.match(view, /到第二压力位预计净亏损/)
-  assert.match(view, /初始开仓价/)
-  assert.match(view, /第一压力位 \/ 加仓价/)
-  assert.match(view, /第二压力位 \/ 硬止损价/)
-  assert.match(view, /止盈价/)
-  assert.match(view, /实际成交价格/)
-  assert.match(view, /实际成交 BTC 数量/)
-  assert.match(view, /提醒不是成交/)
-  assert.match(view, /仅展示你人工确认的成交/)
-  assert.match(view, /剩余 BTC/)
-  assert.match(view, /分段减仓后 MFE\/MAE 暂不支持/)
-  assert.match(view, /全成本保本价/)
-  assert.match(view, /executionRisk\?\.netLossAtStop/)
-  assert.match(view, /executionRisk\?\.fullCostBreakevenPrice/)
 })
