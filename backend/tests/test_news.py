@@ -4,7 +4,7 @@ from datetime import datetime, timedelta, timezone
 import httpx
 import pytest
 
-from backend.news import NewsAggregator, aggregate_news, canonical_url, parse_okx, parse_rss
+from backend.news import SOURCES, NewsAggregator, aggregate_news, canonical_url, parse_okx, parse_rss
 
 
 NOW = datetime(2026, 7, 12, 3, 0, tzinfo=timezone.utc)
@@ -155,6 +155,19 @@ async def test_async_fetch_partial_and_unavailable_degrade_safely():
     assert unavailable["newsScore"] == 0
     assert unavailable["clusters"] == []
     json.dumps(unavailable, allow_nan=False)
+
+
+@pytest.mark.asyncio
+async def test_news_redirects_are_rejected_without_following_the_target():
+    requests=[]
+    def redirect_handler(request):
+        requests.append(str(request.url))
+        return httpx.Response(302,headers={"location":"http://127.0.0.1/private"})
+    async with httpx.AsyncClient(transport=httpx.MockTransport(redirect_handler)) as client:
+        result=await NewsAggregator(client).fetch()
+    assert result["status"]=="unavailable"
+    assert len(requests)==len(SOURCES)
+    assert all("127.0.0.1" not in request for request in requests)
 
 
 @pytest.mark.asyncio

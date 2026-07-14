@@ -397,12 +397,27 @@ class NewsAggregator:
             headers = {"Accept": "application/json" if source == "okx" else "application/rss+xml, application/xml",
                        "Accept-Language": "zh-CN" if source == "okx" else "en-US",
                        "User-Agent": "okx-btc-advisor/1.0 (local educational analysis)"}
-            expected_host=(urlsplit(SOURCES[source]).hostname or "").lower()
+            source_parts=urlsplit(SOURCES[source])
+            expected_host=(source_parts.hostname or "").lower()
+            if (
+                source_parts.scheme!="https"
+                or source_parts.port not in (None,443)
+                or source_parts.username is not None
+                or source_parts.password is not None
+            ):
+                raise ValueError("news source URL is not an approved HTTPS endpoint")
             content=bytearray()
-            async with client.stream("GET",SOURCES[source],headers=headers,timeout=self.timeout,follow_redirects=True) as response:
+            async with client.stream("GET",SOURCES[source],headers=headers,timeout=self.timeout,follow_redirects=False) as response:
+                if response.is_redirect:
+                    raise ValueError("news redirects are not allowed")
                 response.raise_for_status()
-                if (response.url.host or "").lower()!=expected_host:
-                    raise ValueError("news redirect left the configured source host")
+                if (
+                    response.url.scheme!="https"
+                    or (response.url.host or "").lower()!=expected_host
+                    or response.url.port not in (None,443)
+                    or bool(response.url.userinfo)
+                ):
+                    raise ValueError("news response left the configured source host")
                 length=response.headers.get("content-length")
                 if length and int(length)>2_000_000:
                     raise ValueError("response exceeds 2 MB")

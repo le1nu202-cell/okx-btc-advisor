@@ -20,6 +20,9 @@ class OKXError(RuntimeError): pass
 
 
 class OKXPublicClient:
+    REST_ORIGIN = "https://www.okx.com"
+    PUBLIC_WS_URL = "wss://ws.okx.com:8443/ws/v5/public"
+    BUSINESS_WS_URL = "wss://ws.okx.com:8443/ws/v5/business"
     MIN_MARKET_TS = 1_230_768_000_000
     BULK_DOWNLOAD_HOSTS = {"static.okx.com"}
     MAX_BULK_URLS = 64
@@ -29,11 +32,42 @@ class OKXPublicClient:
     MAX_COMPRESSION_RATIO = 200
 
     def __init__(self, base_url="https://www.okx.com", ws_url="wss://ws.okx.com:8443/ws/v5/public", business_ws_url="wss://ws.okx.com:8443/ws/v5/business", timeout=20):
-        self.base_url=base_url.rstrip("/"); self.ws_url=ws_url; self.business_ws_url=business_ws_url; self.timeout=timeout
+        self.base_url=self._validated_rest_url(base_url)
+        self.ws_url=self._validated_ws_url(ws_url,"/ws/v5/public")
+        self.business_ws_url=self._validated_ws_url(business_ws_url,"/ws/v5/business")
+        self.timeout=timeout
+
+    @classmethod
+    def _validated_rest_url(cls,value:str)->str:
+        try:parts=urlsplit(str(value))
+        except (TypeError,ValueError) as exc:raise ValueError("OKX REST 地址必须是官方公共主机 https://www.okx.com") from exc
+        try:port=parts.port
+        except ValueError as exc:raise ValueError("OKX REST 地址端口无效") from exc
+        valid=(
+            parts.scheme.lower()=="https" and (parts.hostname or "").lower()=="www.okx.com"
+            and port is None and parts.path in ("","/") and not parts.query and not parts.fragment
+            and parts.username is None and parts.password is None
+        )
+        if not valid:raise ValueError("OKX REST 地址必须是官方公共主机 https://www.okx.com")
+        return cls.REST_ORIGIN
+
+    @classmethod
+    def _validated_ws_url(cls,value:str,expected_path:str)->str:
+        try:parts=urlsplit(str(value))
+        except (TypeError,ValueError) as exc:raise ValueError("OKX WebSocket 地址必须是官方免鉴权行情端点") from exc
+        try:port=parts.port
+        except ValueError as exc:raise ValueError("OKX WebSocket 地址端口无效") from exc
+        valid=(
+            parts.scheme.lower()=="wss" and (parts.hostname or "").lower()=="ws.okx.com"
+            and port==8443 and parts.path==expected_path and not parts.query and not parts.fragment
+            and parts.username is None and parts.password is None
+        )
+        if not valid:raise ValueError("OKX WebSocket 地址必须是官方免鉴权行情端点")
+        return f"wss://ws.okx.com:8443{expected_path}"
 
     async def _get(self,path,params=None):
         last=None
-        async with httpx.AsyncClient(base_url=self.base_url,timeout=self.timeout,follow_redirects=True) as client:
+        async with httpx.AsyncClient(base_url=self.base_url,timeout=self.timeout,follow_redirects=False) as client:
             for attempt in range(3):
                 try:
                     r=await client.get(path,params=params); r.raise_for_status(); body=r.json()
@@ -180,16 +214,33 @@ class OKXPublicClient:
         if len(urls)>self.MAX_BULK_URLS:
             raise OKXError("too many bulk funding files")
         out={}
-        async with httpx.AsyncClient(timeout=60,follow_redirects=True) as client:
+        # Reject redirects rather than validating only the final URL: every
+        # outbound hop must remain inside the explicit official-host policy.
+        async with httpx.AsyncClient(timeout=60,follow_redirects=False) as client:
             for url in urls:
                 parts=urlsplit(url)
-                if parts.scheme!="https" or (parts.hostname or "").lower() not in self.BULK_DOWNLOAD_HOSTS:
+                try:port=parts.port
+                except ValueError as exc:raise OKXError("untrusted bulk funding download URL") from exc
+                if (
+                    parts.scheme!="https"
+                    or (parts.hostname or "").lower() not in self.BULK_DOWNLOAD_HOSTS
+                    or port not in (None,443)
+                    or parts.username is not None
+                    or parts.password is not None
+                ):
                     raise OKXError("untrusted bulk funding download URL")
                 raw=bytearray()
                 async with client.stream("GET",url) as response:
+                    if response.is_redirect:
+                        raise OKXError("bulk funding redirects are not allowed")
                     response.raise_for_status()
                     final=response.url
-                    if final.scheme!="https" or (final.host or "").lower() not in self.BULK_DOWNLOAD_HOSTS:
+                    if (
+                        final.scheme!="https"
+                        or (final.host or "").lower() not in self.BULK_DOWNLOAD_HOSTS
+                        or getattr(final,"port",None) not in (None,443)
+                        or bool(getattr(final,"userinfo",None))
+                    ):
                         raise OKXError("bulk funding redirect left the trusted host")
                     length=response.headers.get("content-length")
                     if length and int(length)>self.MAX_DOWNLOAD_BYTES:
@@ -224,7 +275,17 @@ class OKXPublicClient:
         delay=1
         while not stop.is_set():
             try:
-                async with websockets.connect(url,ping_interval=20,ping_timeout=15) as ws:
+                connector=websockets.connect(
+                    url,ping_interval=20,ping_timeout=15,
+                    host="ws.okx.com",port=8443,
+                )
+                # websockets follows redirects by default. Disable every
+                # redirect (including same-origin path changes) so an OKX
+                # endpoint can never redirect this public-only client to a
+                # private path or another host.
+                if hasattr(connector,"process_redirect"):
+                    connector.process_redirect=lambda exc: exc
+                async with connector as ws:
                     await ws.send(json.dumps({"op":"subscribe","args":args}))
                     healthy=False
                     async for raw in ws:

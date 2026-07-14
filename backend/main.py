@@ -5,6 +5,7 @@ import ipaddress
 import json
 import math
 import os
+import threading
 import time
 import uuid
 from concurrent.futures import ProcessPoolExecutor
@@ -22,15 +23,38 @@ from fastapi.staticfiles import StaticFiles
 
 from .backtest import run_backtest
 from .db import Database
-from .models import AdviceAction, BacktestRequest, BacktestStatus, MarketRegime, MarketSnapshot, Settings, SignalAdvice
+from .models import AdviceAction, BacktestRequest, BacktestStatus, Candle, MarketRegime, MarketSnapshot, Settings, SignalAdvice
 from .news import NewsAggregator, aggregate_news
 from .okx import OKXPublicClient
 from .strategy import analyze, estimate_risk
 from .technical import analyze_technical
+from .workbench import (
+    TERMINAL_STATES,
+    ReplayCreateRequest,
+    ReplayPlanRequest,
+    RiskCalculation,
+    TradeActionRequest,
+    TradePlanDraft,
+    TradeState,
+    apply_action,
+    build_add_check,
+    build_trade_log,
+    calculate_risk,
+    candle_mark_to_market,
+    make_plan_record,
+    new_id,
+    now_ms,
+    price_trigger,
+    recompute_execution,
+    replay_candle_transition,
+    replay_start_index,
+    trade_statistics,
+    visible_replay_candles,
+)
 
 INSTRUMENT="BTC-USDT-SWAP"
 APP_ID="okx-btc-advisor"
-APP_VERSION="0.3.0"
+APP_VERSION="0.4.0"
 MAX_WEBSOCKET_CONNECTIONS=32
 NEWS_POLL_SECONDS=300
 NEWS_SOURCE_STALE_MS=15*60_000
@@ -41,11 +65,12 @@ def _empty_news(message="新闻源正在连接"):
     return {"items":[],"analysis":{"asOf":None,"windowHours":48,"score":0,"articleCount":0,"status":"unavailable","sourceCoverage":0,"sourceStatus":[],"rawImpact":0,"coverageAdjustedImpact":0,"reason":"新闻数据不可用，严格按中性处理","warnings":[message]}}
 
 
-runtime={"price":None,"ticker_ts":None,"connection":"starting","stream_status":{"public":"starting","candles":"starting"},"stop":None,"task":None,"bootstrap_task":None,"resync_task":None,"reconcile_task":None,"news_task":None,"backtest_tasks":set(),"news":_empty_news(),"news_source_status":[],"news_checked":False,"news_last_success":None}
+runtime={"price":None,"ticker_ts":None,"connection":"starting","stream_status":{"public":"starting","candles":"starting"},"stop":None,"task":None,"bootstrap_task":None,"resync_task":None,"reconcile_task":None,"news_task":None,"backtest_tasks":set(),"news":_empty_news(),"news_source_status":[],"news_checked":False,"news_last_success":None,"plan_check_ts":0}
 subscribers:set[WebSocket]=set()
 pending_websockets=0
 news_aggregator=NewsAggregator()
 backtest_lock=asyncio.Lock()
+trade_plan_lock=threading.RLock()
 backtest_executor:ProcessPoolExecutor|None=None
 
 
@@ -213,6 +238,59 @@ async def broadcast(payload:dict):
     for ws in dead:subscribers.discard(ws)
 
 
+def _save_terminal_trade_log(record:dict,source:str="live") -> dict|None:
+    state=TradeState(record["state"])
+    if state not in {TradeState.TAKE_PROFIT,TradeState.STOPPED}:return None
+    if record.get("logId"):
+        existing=[row for row in db.trade_logs(source,500) if row.get("id")==record["logId"]]
+        return existing[0] if existing else None
+    # A live plan has exactly one terminal log. A deterministic key protects
+    # the single-process application from duplicate writes even if a client
+    # retries the same confirmation while the first response is in flight.
+    record["logId"]=f"live:{record['id']}" if source=="live" else new_id()
+    if source=="replay":regime=str(record.get("regime4H") or "UNKNOWN")
+    else:
+        try:regime=current_advice().regime.value
+        except Exception:regime="UNKNOWN"
+    log=build_trade_log(record,source,regime)
+    log["id"]=record["logId"]
+    db.save_trade_plan(record,active=True) if source=="live" else None
+    db.save_trade_log(log,source)
+    return log
+
+
+async def evaluate_active_plan_price(price:float|None) -> None:
+    if price is None:return
+    now=int(time.time()*1000)
+    if now-int(runtime.get("plan_check_ts") or 0)<1000:return
+    runtime["plan_check_ts"]=now
+    alert=None
+    try:
+        with trade_plan_lock:
+            record=db.get_active_trade_plan()
+            if not record:return
+            state=TradeState(record["state"])
+            if state in TERMINAL_STATES:return
+            fresh,_=_live_market_ready(now)
+            before_state=record["state"]
+            updated,event,message=price_trigger(record,float(price),fresh)
+            execution=recompute_execution(updated).get("execution",{})
+            if fresh and state not in {TradeState.PLANNED,TradeState.IDLE} and execution.get("mfeMaeSupported") and execution.get("openedQuantityBtc",0)>0:
+                mark=Candle(timestamp=now,open=float(price),high=float(price),low=float(price),close=float(price),volume=0,timeframe="live",confirm=False)
+                favorable,adverse=candle_mark_to_market(updated,mark)
+                updated["mfeUsdt"]=max(float(updated.get("mfeUsdt") or 0),favorable)
+                updated["maeUsdt"]=max(float(updated.get("maeUsdt") or 0),adverse)
+            changed=updated!=record
+            if changed:db.save_trade_plan(updated,active=True)
+            if event:
+                db.save_trade_plan_event(updated["id"],before_state,updated["state"],event,float(price),{"message":message})
+                alert={"type":"tradePlanAlert","event":event,"message":message,"plan":updated,"log":None}
+    except (TypeError,ValueError,ArithmeticError):
+        # A damaged local plan must never break public market ingestion.
+        return
+    if alert:await broadcast(alert)
+
+
 async def publish_current_signal():
     advice=current_advice()
     if advice.action.value=="WAIT":return False
@@ -276,6 +354,8 @@ async def on_okx(msg:dict):
         if parsed:db.upsert_oi(INSTRUMENT,*parsed);valid=True
     if valid:update_stream_status(stream_name,"connected")
     await broadcast({"type":"market","price":runtime["price"],"tickerTime":runtime["ticker_ts"],"connectionStatus":runtime["connection"]})
+    if channel=="tickers" and valid:
+        await evaluate_active_plan_price(runtime["price"])
 
 
 async def resync_market_history()->bool:
@@ -367,20 +447,46 @@ async def lifespan(app:FastAPI):
         backtest_executor.shutdown(wait=False,cancel_futures=True);backtest_executor=None
 
 
-def _local_hostname(value:str|None)->bool:
+def _local_hostname(value:str|None,*,allow_testserver:bool=False)->bool:
     if not value:return False
-    try:host=(urlsplit(value if "://" in value else f"//{value}").hostname or "").lower()
+    try:
+        parsed=urlsplit(value if "://" in value else f"//{value}")
+        host=(parsed.hostname or "").lower()
+        parsed.port
     except ValueError:return False
-    if host in {"localhost","testserver"}:return True
+    if parsed.username is not None or parsed.password is not None:return False
+    if parsed.path not in ("","/") or parsed.query or parsed.fragment:return False
+    if host=="testserver":return allow_testserver
+    if host=="localhost":return True
     try:return ipaddress.ip_address(host).is_loopback
     except ValueError:return False
 
 
-def _local_origin(value:str|None)->bool:
+def _origin_allowed(value:str|None,request_host:str|None)->bool:
     if not value:return False
-    try:parsed=urlsplit(value)
+    try:
+        parsed=urlsplit(value)
+        host_parts=urlsplit(f"//{request_host or ''}")
+        origin_port=parsed.port or (443 if parsed.scheme=="https" else 80)
+        request_port=host_parts.port or (443 if parsed.scheme=="https" else 80)
     except ValueError:return False
-    return parsed.scheme in {"http","https"} and parsed.username is None and _local_hostname(value)
+    if (
+        parsed.scheme not in {"http","https"}
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.path not in ("","/")
+        or parsed.query
+        or parsed.fragment
+        or not _local_hostname(value)
+    ):return False
+    normalized=f"{parsed.scheme}://{(parsed.hostname or '').lower()}:{origin_port}"
+    if normalized in {"http://127.0.0.1:5173","http://localhost:5173"}:return True
+    return (
+        (parsed.hostname or "").lower()==(host_parts.hostname or "").lower()
+        and origin_port==request_port
+        and host_parts.username is None
+        and host_parts.password is None
+    )
 
 
 class LoopbackHostMiddleware:
@@ -390,7 +496,8 @@ class LoopbackHostMiddleware:
         if scope["type"] not in {"http","websocket"}:
             await self.app(scope,receive,send);return
         host=next((value.decode("latin-1") for key,value in scope.get("headers",[]) if key.lower()==b"host"),"")
-        if _local_hostname(host):
+        allow_testserver=os.getenv("OKX_TEST_MODE")=="1"
+        if _local_hostname(host,allow_testserver=allow_testserver):
             await self.app(scope,receive,send);return
         if scope["type"]=="websocket":
             await send({"type":"websocket.close","code":1008,"reason":"Invalid host"})
@@ -484,6 +591,191 @@ def settings_get():return db.get_settings()
 
 @app.put("/api/settings",response_model=Settings,response_model_by_alias=True)
 def settings_put(value:Settings):db.put_settings(value);return value
+
+
+@app.post("/api/workbench/calculate")
+def workbench_calculate(value:TradePlanDraft):
+    return calculate_risk(value).model_dump(by_alias=True,mode="json")
+
+
+@app.get("/api/trade-plans/current")
+def trade_plan_current():
+    with trade_plan_lock:
+        value=db.get_active_trade_plan()
+        if value:
+            value=recompute_execution(value)
+            db.save_trade_plan(value,active=True)
+            return value
+    return {"id":None,"state":TradeState.IDLE.value,"plan":None,"risk":None,"events":[]}
+
+
+@app.post("/api/trade-plans",status_code=201)
+def trade_plan_create(value:TradePlanDraft):
+    with trade_plan_lock:
+        existing=db.get_active_trade_plan()
+        if existing and TradeState(existing["state"]) not in TERMINAL_STATES:
+            raise HTTPException(409,"已有未结束的交易计划，请先完成或取消")
+        try:record=make_plan_record(value)
+        except ValueError as exc:raise HTTPException(422,str(exc)) from exc
+        db.save_trade_plan(record,active=True)
+        db.save_trade_plan_event(record["id"],TradeState.IDLE.value,TradeState.PLANNED.value,"CREATE_PLAN",None,{"risk":record["risk"]})
+        return record
+
+
+@app.put("/api/trade-plans/{plan_id}")
+def trade_plan_update(plan_id:str,value:TradePlanDraft):
+    with trade_plan_lock:
+        record=db.get_trade_plan(plan_id)
+        if not record:raise HTTPException(404,"交易计划不存在")
+        if TradeState(record["state"])!=TradeState.PLANNED:
+            raise HTTPException(409,"只有尚未确认初始开仓的计划可以修改价格和仓位")
+        risk=calculate_risk(value)
+        if not risk.valid:raise HTTPException(422,"；".join(risk.errors))
+        updated={**record,"plan":value.model_dump(by_alias=True,mode="json"),"risk":risk.model_dump(by_alias=True,mode="json"),"updatedAt":now_ms()}
+        updated.pop("activeReminder",None)
+        updated=recompute_execution(updated)
+        db.save_trade_plan(updated,active=True)
+        db.save_trade_plan_event(plan_id,record["state"],record["state"],"UPDATE_PLAN",None,{"risk":updated["risk"]})
+        return updated
+
+
+@app.post("/api/trade-plans/{plan_id}/actions")
+def trade_plan_action(plan_id:str,value:TradeActionRequest):
+    with trade_plan_lock:
+        record=db.get_trade_plan(plan_id)
+        if not record:raise HTTPException(404,"交易计划不存在")
+        before=record["state"]
+        try:updated,target=apply_action(record,value)
+        except ValueError as exc:raise HTTPException(409,str(exc)) from exc
+        db.save_trade_plan(updated,active=True)
+        db.save_trade_plan_event(plan_id,before,target,value.action.value,value.price,{"note":value.note,"quantityBtc":value.quantity_btc})
+        log=_save_terminal_trade_log(updated,"live")
+        return {"plan":updated,"log":log}
+
+
+@app.get("/api/trade-plans/{plan_id}/events")
+def trade_plan_event_history(plan_id:str,limit:int=Query(200,ge=1,le=1000)):
+    if not db.get_trade_plan(plan_id):raise HTTPException(404,"交易计划不存在")
+    return {"items":db.trade_plan_events(plan_id,limit)}
+
+
+@app.get("/api/workbench/add-check")
+def workbench_add_check():
+    record=db.get_active_trade_plan()
+    if not record:raise HTTPException(404,"当前没有交易计划")
+    plan=TradePlanDraft.model_validate(record["plan"]);risk=RiskCalculation.model_validate(record["risk"])
+    c1=db.candles(INSTRUMENT,"1H",220,confirmed_only=True);c4=db.candles(INSTRUMENT,"4H",200,confirmed_only=True)
+    funding=db.latest_funding(INSTRUMENT);oi=db.open_interest_context(INSTRUMENT)
+    fresh,_=_live_market_ready()
+    try:regime=current_advice().regime
+    except Exception:regime=MarketRegime.STALE
+    try:technical=technical_summary()
+    except Exception:technical=None
+    return build_add_check(plan,risk,c1,c4,runtime["price"],funding[1] if funding else None,oi,technical,regime,fresh)
+
+
+@app.get("/api/trade-logs")
+def trade_log_history(source:str=Query("live",pattern="^(live|replay)$"),limit:int=Query(200,ge=1,le=1000)):
+    return {"items":db.trade_logs(source,limit)}
+
+
+@app.get("/api/trade-logs/statistics")
+def trade_log_statistics(source:str=Query("live",pattern="^(live|replay)$")):
+    return trade_statistics(db.trade_logs(source,1000))
+
+
+def _replay_data(record:dict)->dict:
+    one=db.candles_since(INSTRUMENT,"1H",0,confirmed_only=True)
+    four=db.candles_since(INSTRUMENT,"4H",0,confirmed_only=True)
+    index=next((i for i,candle in enumerate(one) if candle.timestamp==record["cursorTs"]),None)
+    if index is None:raise HTTPException(409,"Replay 所需历史 K 线已不存在")
+    visible_one,visible_four=visible_replay_candles(one,four,index)
+    public={**record,"candles1H":[row.model_dump(by_alias=True,mode="json") for row in visible_one],"candles4H":[row.model_dump(by_alias=True,mode="json") for row in visible_four]}
+    # The server keeps the next index private. No future candles, indicators or news are included.
+    public.pop("cursorIndex",None)
+    return public
+
+
+@app.post("/api/replay/sessions",status_code=201)
+def replay_create(value:ReplayCreateRequest):
+    one=db.candles_since(INSTRUMENT,"1H",0,confirmed_only=True)
+    four=db.candles_since(INSTRUMENT,"4H",0,confirmed_only=True)
+    try:index=replay_start_index(one,value.mode,value.start_at)
+    except ValueError as exc:raise HTTPException(422,str(exc)) from exc
+    now=now_ms();record={
+        "id":new_id(),"status":"SELECTED","state":TradeState.IDLE.value,
+        "mode":value.mode,"cursorTs":one[index].timestamp,"cursorIndex":index,
+        "plan":None,"risk":None,"addCount":0,"actualFills":{},"events":[],
+        "mfeUsdt":0.0,"maeUsdt":0.0,"regime4H":"UNKNOWN","createdAt":now,"updatedAt":now,"result":None,
+    }
+    db.save_replay_session(record)
+    return _replay_data(record)
+
+
+@app.put("/api/replay/sessions/{session_id}/plan")
+def replay_set_plan(session_id:str,value:ReplayPlanRequest):
+    record=db.get_replay_session(session_id)
+    if not record:raise HTTPException(404,"Replay 会话不存在")
+    risk=calculate_risk(value.plan)
+    if not risk.valid:raise HTTPException(422,"；".join(risk.errors))
+    updated={
+        **record,"status":"RUNNING","state":TradeState.INITIAL_OPEN.value,
+        "plan":value.plan.model_dump(by_alias=True,mode="json"),
+        "risk":risk.model_dump(by_alias=True,mode="json"),
+        "actualFills":{"initial":{"price":risk.initial_fill_price,"quantityBtc":risk.initial_quantity_btc}},"updatedAt":now_ms(),
+    }
+    updated=recompute_execution(updated)
+    db.save_replay_session(updated)
+    return _replay_data(updated)
+
+
+@app.post("/api/replay/sessions/{session_id}/actions")
+def replay_action(session_id:str,value:TradeActionRequest):
+    record=db.get_replay_session(session_id)
+    if not record:raise HTTPException(404,"Replay 会话不存在")
+    if not record.get("plan"):raise HTTPException(409,"请先在隐藏未来数据的图表上设置交易计划")
+    try:updated,_=apply_action(record,value)
+    except ValueError as exc:raise HTTPException(409,str(exc)) from exc
+    if TradeState(updated["state"]) in TERMINAL_STATES:updated["status"]="COMPLETE"
+    updated["events"]=[*list(updated.get("events") or []),{"type":value.action.value,"price":value.price,"at":updated["cursorTs"]}]
+    log=_save_terminal_trade_log(updated,"replay")
+    if log:updated["result"]=log
+    db.save_replay_session(updated)
+    return _replay_data(updated)
+
+
+@app.post("/api/replay/sessions/{session_id}/step")
+def replay_step(session_id:str,count:int=Query(1,ge=1,le=24)):
+    record=db.get_replay_session(session_id)
+    if not record:raise HTTPException(404,"Replay 会话不存在")
+    if record.get("status")!="RUNNING" or not record.get("plan"):
+        raise HTTPException(409,"Replay 尚未设置计划或已经结束")
+    one=db.candles_since(INSTRUMENT,"1H",0,confirmed_only=True)
+    index=next((i for i,candle in enumerate(one) if candle.timestamp==record["cursorTs"]),None)
+    if index is None:raise HTTPException(409,"Replay 所需历史 K 线已不存在")
+    updated=record
+    for _ in range(count):
+        index+=1
+        if index>=len(one):
+            updated["status"]="COMPLETE";break
+        updated={**updated,"cursorTs":one[index].timestamp,"cursorIndex":index,"updatedAt":now_ms()}
+        updated,event=replay_candle_transition(updated,one[index])
+        if event:
+            updated["events"]=[*list(updated.get("events") or []),{"type":event,"price":None,"at":one[index].timestamp}]
+        if TradeState(updated["state"]) in TERMINAL_STATES:
+            updated["status"]="COMPLETE"
+            log=_save_terminal_trade_log(updated,"replay")
+            if log:updated["result"]=log
+            break
+    db.save_replay_session(updated)
+    return _replay_data(updated)
+
+
+@app.get("/api/replay/sessions/{session_id}")
+def replay_get(session_id:str):
+    record=db.get_replay_session(session_id)
+    if not record:raise HTTPException(404,"Replay 会话不存在")
+    return _replay_data(record)
 
 
 @app.delete("/api/local-data")
@@ -609,7 +901,7 @@ def backtest_delete(id:str):
 async def live(ws:WebSocket):
     global pending_websockets
     origin=ws.headers.get("origin")
-    if origin is not None and not _local_origin(origin):
+    if origin is not None and not _origin_allowed(origin,ws.headers.get("host")):
         await ws.close(code=1008,reason="Origin is not allowed");return
     if len(subscribers)+pending_websockets>=MAX_WEBSOCKET_CONNECTIONS:
         await ws.close(code=1013,reason="Too many local connections");return

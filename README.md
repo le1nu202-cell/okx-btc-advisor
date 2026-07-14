@@ -1,8 +1,10 @@
-# OKX BTC 永续合约策略观察台
+# BTC 分批加仓交易与风险工作台
 
-这是一个只在本机运行、只读取 OKX 公共行情的中文分析网页。它分析 `BTC-USDT-SWAP`：用 4H 判断趋势、震荡或过渡环境，再用已收盘的 1H K 线生成候选、观察或等待建议。
+这是一个只在本机运行、只读取 OKX 公共/免鉴权行情的中文手动交易辅助工具。默认首页用于规划 `BTC-USDT-SWAP` 的初始仓、一次加仓、回到保本区后的部分减仓、止盈与硬止损；方向、价格和真实成交均由用户自己决定并确认。
 
-> 本项目是行情分析与教育性风险测算工具，不构成个性化投资建议，不承诺收益，不连接账户，也不会自动下单。当前冻结预设的严格三年回测均未通过，页面因此统一标记为“实验信号”。
+软件负责计算、提醒、保存计划和记录结果，但不会连接账户、自动判断必须做多或做空，也不会下单、改单、撤单或根据行情自动认定用户已经成交。
+
+> 本项目是行情分析与教育性风险测算工具，不构成个性化投资建议，不承诺收益。研究区冻结预设的严格三年回测均未通过，因此继续统一标记为“实验信号”。
 
 ## 直接打开
 
@@ -31,14 +33,26 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\start.ps1 -SkipInstall
 
 同一份 SQLite 数据库只应运行一个服务实例。如需在另一端口隔离测试，请同时设置不同的 `OKX_ADVISOR_DB` 路径。
 
-## 页面各部分
+## 交易工作台（默认首页）
+
+- **四价计划**：用户填写做多/做空、初始开仓价、第一压力位、第二压力位和止盈价；默认账户权益 `80 USDT`、杠杆 `66x`、初始保证金 `4%`、加仓倍数 `2`。
+- **真实风险**：按每次成交价分别换算 BTC 数量，再计算加权均价、三类保本价、费用、滑点、止盈净利和第二压力位止损净亏。首页首先显示绝对亏损 USDT，再显示账户百分比。
+- **最大亏损反推**：可根据用户允许的最大亏损反推初始保证金，同时保留原计划值供比较。
+- **人工执行**：行情只产生开仓、加仓、减仓、止盈和止损提醒。用户必须提交实际成交价格与 BTC 数量，系统才改变真实成交状态。
+- **部分减仓**：按实际加权成本池结算已实现盈亏和费用，保留剩余数量及成本；最终退出只结算剩余仓位。
+- **状态恢复**：当前计划、成交分段和最终日志保存在本机 SQLite，刷新页面或重启服务后恢复。
+- **计划价格线**：工作台 1H 图表同步显示初始价、加仓价、硬止损、止盈、加权均价和全成本保本价。
+
+## 研究区（次级页面）
+
+原有自动方向评分、技术指标、新闻、回测和失败记录继续保留，但不再占据默认首页。研究信号不会自动修改手动交易计划。
 
 - **顶部行情**：当前价格、4H 市场状态、资金费率、公开持仓量、数据时间和新鲜度。任一实时通道断开、行情超过 30 秒或近期 K 线有缺口时，系统强制等待。
 - **1H / 4H 图表**：展示实时行情；只有 OKX `confirm=1` 的已收盘 K 线进入策略，未收盘 K 线只用于图表。
 - **当前策略建议**：显示动作、策略技术分、该根 K 线实际采用的新闻分、综合方向分、置信度及数据质量。趋势策略在 `±60` 以上才成为候选，`±30～59` 为观察，中间区域等待。
 - **触发、失效与目标**：趋势策略显示结构/ATR 中更保守的止损及 1R、2R 目标；震荡策略显示布林中轨和对侧轨目标。所有价格都是研究参考，不是成交保证。
 - **指标贡献**：解释 EMA、ADX、MACD、RSI、OBV、量能和 20 根突破等规则如何贡献技术分。
-- **教育性仓位测算**：只有用户自行填写账户权益、每笔风险和计划杠杆后才计算。风险限制为 `0.1%～2%`，杠杆限制为 `1x～2x`；手续费、资金费率和滑点需另行考虑。
+- **旧教育性仓位模型**：旧的 `1x～2x` 简化模型仅属于研究区历史口径，不用于 v0.4 手动交易计划和真实风险计算。
 - **辅助技术共振**：独立展示多周期趋势、Donchian 结构、日/周 VWAP、近似成交密集区、MFI、Stoch RSI、Williams %R 和波动分位。这是研究层，不会暗中改变冻结策略分数。
 - **消息面新闻**：聚合 OKX 公告、CoinDesk、Cointelegraph Bitcoin 和 Decrypt；展示事件重要度、方向、相关性、跨源确认、来源覆盖和时间衰减。新闻最多修正方向分 `±15`，技术分不足时不能单独制造候选；来源失败或新闻过期时严格归零。
 - **回测与样本外验证**：可选择趋势、震荡或组合策略，查看任务进度、历史覆盖、净值/回撤、年度和行情状态、5/10/20bp 滑点压力、滚动窗口、锁定样本及三项基准。
@@ -62,11 +76,18 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\start.ps1 -SkipInstall
 ## 数据与安全边界
 
 - 不要求、读取或保存 OKX API Key；源码不包含账户、下单、改单、撤单或私有交易接口。
+- 可配置的 OKX REST/WebSocket 地址必须通过官方主机及公共路径白名单；非法主机或私有路径会被拒绝。
 - 服务固定监听 `127.0.0.1`，并限制 Host、WebSocket Origin、连接数和安全响应头。
 - OKX 公共 `/public` WebSocket 更新 ticker、资金费率和持仓量；未鉴权 `/business` WebSocket 更新 1H/4H K 线。REST 每 5 分钟对账，发现缺口或断线后深度回补并指数退避重连。
 - K 线按时间排序、去重，已确认状态不可被迟到的未确认数据降级；时间倒退、坏数据和数据缺口会进入保护状态。
 - 新闻以整批来源完成后的提交时点为可见时间，避免慢请求把事后新闻错误回填到过去的 K 线决策。
 - 设置、信号、行情和回测只写入本机 SQLite；API 禁止缓存，页面不主动加载第三方字体或脚本。
+
+SQLite 不含交易所密钥，但会保存账户权益、个人计划、实际成交、盈亏、备注和截图路径，属于个人交易数据：
+
+- 不要把 `backend/data/` 中的真实数据库上传到公开仓库或网盘分享链接。
+- 不要提交个人截图、`logs/` 日志、`.env` 或包含真实交易细节的导出文件。
+- 本地数据库没有应用级加密；同一 Windows 用户权限下的其他进程仍可能读取它。
 
 ## 验证与开发
 
@@ -76,12 +97,21 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\start.ps1 -SkipInstall
 powershell -NoProfile -ExecutionPolicy Bypass -File .\verify.ps1
 ```
 
-当前版本 `0.3.0` 的最终验证结果为：后端 `128 passed`、前端 `21 passed`、Python 编译、PowerShell 语法检查、TypeScript 检查和 Vite 生产构建全部通过。
+当前版本为 `0.4.0`。发布前使用 `verify.ps1` 运行 Python 编译、完整后端测试、前端测试、TypeScript 检查和 Vite 生产构建；实际结果记录在 [PROGRESS.md](./PROGRESS.md)。
 
 主要本地接口：
 
 - `GET /api/health`
 - `GET /api/market/snapshot`
+- `POST /api/workbench/calculate`
+- `GET /api/trade-plans/current`
+- `POST /api/trade-plans`
+- `PUT /api/trade-plans/{id}`
+- `POST /api/trade-plans/{id}/actions`
+- `GET /api/trade-plans/{id}/events`
+- `GET /api/workbench/add-check`
+- `GET /api/trade-logs`
+- `GET /api/trade-logs/statistics`
 - `GET /api/advice/current`
 - `GET /api/advice/history`
 - `GET /api/technical/summary`
@@ -89,6 +119,6 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\verify.ps1
 - `GET/PUT /api/settings`
 - `POST/GET /api/backtests`
 - `GET/DELETE /api/backtests/{id}`
-- `/ws/live`
+- `WS /ws/live`
 
 方法参考：[OKX 公共 API](https://www.okx.com/docs-v5/en/)、[TA-Lib 指标列表](https://ta-lib.github.io/ta-lib-python/funcs.html)、[The Probability of Backtest Overfitting](https://papers.ssrn.com/sol3/papers.cfm?abstract_id=2326253) 和 [The Deflated Sharpe Ratio](https://www.davidhbailey.com/dhbpapers/deflated-sharpe.pdf)。

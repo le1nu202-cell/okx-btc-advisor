@@ -13,7 +13,7 @@ from typing import Iterable
 from .models import AdviceAction, Candle, Settings, SignalAdvice
 
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 OI_SAMPLE_BUCKET_MS = 5*60_000
 NEWS_SOURCE_CHECK_RETENTION_MS = 7*86400_000
 
@@ -55,6 +55,29 @@ CREATE TABLE IF NOT EXISTS news_source_checks (
  PRIMARY KEY(source,observed_at)
 );
 CREATE INDEX IF NOT EXISTS idx_news_source_checks_time ON news_source_checks(observed_at DESC);
+CREATE TABLE IF NOT EXISTS trade_plans (
+ id TEXT PRIMARY KEY, state TEXT NOT NULL, active INTEGER NOT NULL,
+ payload TEXT NOT NULL, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_trade_plans_one_active ON trade_plans(active) WHERE active=1;
+CREATE INDEX IF NOT EXISTS idx_trade_plans_updated ON trade_plans(updated_at DESC);
+CREATE TABLE IF NOT EXISTS trade_plan_events (
+ id INTEGER PRIMARY KEY AUTOINCREMENT, plan_id TEXT NOT NULL,
+ from_state TEXT NOT NULL, to_state TEXT NOT NULL, event_type TEXT NOT NULL,
+ price REAL, payload TEXT NOT NULL, created_at INTEGER NOT NULL,
+ FOREIGN KEY(plan_id) REFERENCES trade_plans(id)
+);
+CREATE INDEX IF NOT EXISTS idx_trade_plan_events_plan ON trade_plan_events(plan_id,created_at);
+CREATE TABLE IF NOT EXISTS trade_logs (
+ id TEXT PRIMARY KEY, plan_id TEXT, source TEXT NOT NULL,
+ payload TEXT NOT NULL, closed_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_trade_logs_closed ON trade_logs(source,closed_at DESC);
+CREATE TABLE IF NOT EXISTS replay_sessions (
+ id TEXT PRIMARY KEY, status TEXT NOT NULL, cursor_ts INTEGER NOT NULL,
+ payload TEXT NOT NULL, result TEXT, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_replay_sessions_updated ON replay_sessions(updated_at DESC);
 """
 
 
@@ -389,4 +412,116 @@ class Database:
 
     def clear_local_data(self) -> None:
         with self._lock, self.session() as con:
-            for table in ("candles","funding","open_interest","signals","settings","backtests","news_items","news_source_checks"): con.execute(f"DELETE FROM {table}")
+            for table in (
+                "candles","funding","open_interest","signals","settings","backtests",
+                "news_items","news_source_checks","trade_plan_events","trade_plans",
+                "trade_logs","replay_sessions",
+            ):
+                con.execute(f"DELETE FROM {table}")
+
+    def save_trade_plan(self, record: dict, active: bool = True) -> None:
+        now=int(record.get("updatedAt") or time.time()*1000)
+        created=int(record.get("createdAt") or now)
+        with self._lock,self.session() as con:
+            if active:
+                con.execute("UPDATE trade_plans SET active=0 WHERE active=1 AND id<>?",(record["id"],))
+            con.execute(
+                "INSERT INTO trade_plans(id,state,active,payload,created_at,updated_at) VALUES(?,?,?,?,?,?) "
+                "ON CONFLICT(id) DO UPDATE SET state=excluded.state,active=excluded.active,payload=excluded.payload,updated_at=excluded.updated_at",
+                (record["id"],record["state"],int(active),_json_dumps(record),created,now),
+            )
+
+    def get_active_trade_plan(self) -> dict | None:
+        with self.session() as con:
+            row=con.execute("SELECT payload FROM trade_plans WHERE active=1 ORDER BY updated_at DESC LIMIT 1").fetchone()
+        if not row:return None
+        try:return _json_loads(row["payload"])
+        except (TypeError,ValueError,json.JSONDecodeError):return None
+
+    def get_trade_plan(self, plan_id: str) -> dict | None:
+        with self.session() as con:row=con.execute("SELECT payload FROM trade_plans WHERE id=?",(plan_id,)).fetchone()
+        if not row:return None
+        try:return _json_loads(row["payload"])
+        except (TypeError,ValueError,json.JSONDecodeError):return None
+
+    def trade_plans(self, limit: int=100) -> list[dict]:
+        with self.session() as con:rows=con.execute("SELECT payload FROM trade_plans ORDER BY updated_at DESC LIMIT ?",(limit,)).fetchall()
+        result=[]
+        for row in rows:
+            try:result.append(_json_loads(row["payload"]))
+            except (TypeError,ValueError,json.JSONDecodeError):continue
+        return result
+
+    def save_trade_plan_event(
+        self,plan_id:str,from_state:str,to_state:str,event_type:str,
+        price:float|None=None,payload:dict|None=None,created_at:int|None=None,
+    ) -> int:
+        created=int(created_at or time.time()*1000)
+        with self._lock,self.session() as con:
+            cursor=con.execute(
+                "INSERT INTO trade_plan_events(plan_id,from_state,to_state,event_type,price,payload,created_at) VALUES(?,?,?,?,?,?,?)",
+                (plan_id,from_state,to_state,event_type,price,_json_dumps(payload or {}),created),
+            )
+        return int(cursor.lastrowid)
+
+    def trade_plan_events(self,plan_id:str,limit:int=500) -> list[dict]:
+        with self.session() as con:
+            rows=con.execute(
+                "SELECT * FROM trade_plan_events WHERE plan_id=? ORDER BY created_at,id LIMIT ?",
+                (plan_id,limit),
+            ).fetchall()
+        result=[]
+        for row in rows:
+            try:payload=_json_loads(row["payload"])
+            except (TypeError,ValueError,json.JSONDecodeError):payload={}
+            result.append({
+                "id":row["id"],"planId":row["plan_id"],"fromState":row["from_state"],
+                "toState":row["to_state"],"eventType":row["event_type"],"price":row["price"],
+                "payload":payload,"createdAt":row["created_at"],
+            })
+        return result
+
+    def save_trade_log(self,record:dict,source:str="live") -> None:
+        if source not in {"live","replay"}:raise ValueError("invalid trade log source")
+        closed=int(record.get("closedAt") or time.time()*1000)
+        with self._lock,self.session() as con:
+            con.execute(
+                "INSERT INTO trade_logs(id,plan_id,source,payload,closed_at) VALUES(?,?,?,?,?) "
+                "ON CONFLICT(id) DO UPDATE SET payload=excluded.payload,closed_at=excluded.closed_at",
+                (record["id"],record.get("planId"),source,_json_dumps(record),closed),
+            )
+
+    def trade_logs(self,source:str="live",limit:int=500) -> list[dict]:
+        if source not in {"live","replay"}:raise ValueError("invalid trade log source")
+        with self.session() as con:
+            rows=con.execute("SELECT payload FROM trade_logs WHERE source=? ORDER BY closed_at DESC LIMIT ?",(source,limit)).fetchall()
+        result=[]
+        for row in rows:
+            try:result.append(_json_loads(row["payload"]))
+            except (TypeError,ValueError,json.JSONDecodeError):continue
+        return result
+
+    def save_replay_session(self,record:dict) -> None:
+        now=int(record.get("updatedAt") or time.time()*1000)
+        created=int(record.get("createdAt") or now)
+        result=record.get("result")
+        with self._lock,self.session() as con:
+            con.execute(
+                "INSERT INTO replay_sessions(id,status,cursor_ts,payload,result,created_at,updated_at) VALUES(?,?,?,?,?,?,?) "
+                "ON CONFLICT(id) DO UPDATE SET status=excluded.status,cursor_ts=excluded.cursor_ts,payload=excluded.payload,result=excluded.result,updated_at=excluded.updated_at",
+                (record["id"],record["status"],int(record["cursorTs"]),_json_dumps(record),_json_dumps(result) if result is not None else None,created,now),
+            )
+
+    def get_replay_session(self,session_id:str) -> dict | None:
+        with self.session() as con:row=con.execute("SELECT payload FROM replay_sessions WHERE id=?",(session_id,)).fetchone()
+        if not row:return None
+        try:return _json_loads(row["payload"])
+        except (TypeError,ValueError,json.JSONDecodeError):return None
+
+    def replay_sessions(self,limit:int=100) -> list[dict]:
+        with self.session() as con:rows=con.execute("SELECT payload FROM replay_sessions ORDER BY updated_at DESC LIMIT ?",(limit,)).fetchall()
+        result=[]
+        for row in rows:
+            try:result.append(_json_loads(row["payload"]))
+            except (TypeError,ValueError,json.JSONDecodeError):continue
+        return result

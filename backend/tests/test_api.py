@@ -20,7 +20,7 @@ def test_health_and_camel_case_contract():
         health=client.get("/api/health")
         assert health.status_code==200
         assert health.json()["appId"]=="okx-btc-advisor"
-        assert health.json()["version"]=="0.3.0" and health.json()["instrument"]=="BTC-USDT-SWAP"
+        assert health.json()["version"]=="0.4.0" and health.json()["instrument"]=="BTC-USDT-SWAP"
         body=client.get("/api/market/snapshot").json()
         assert "candles1H" in body and "connectionStatus" in body and "fundingRate" in body
         missing=client.get("/api/not-a-real-endpoint")
@@ -55,6 +55,7 @@ def test_loopback_host_validation_and_security_headers():
         assert client.get("/api/health",headers={"host":"localhost:8765"}).status_code==200
         assert client.get("/api/health",headers={"host":"127.0.0.1:8765"}).status_code==200
         assert client.get("/api/health",headers={"host":"[::1]:8765"}).status_code==200
+        assert client.get("/api/health",headers={"host":"evil@127.0.0.1:8765"}).status_code==400
         rejected=client.get("/api/health",headers={"host":"advisor.evil.example"})
         assert rejected.status_code==400
 
@@ -78,6 +79,16 @@ def test_websocket_origin_host_and_connection_limit(monkeypatch):
         assert origin_error.value.code==1008
         with pytest.raises(WebSocketDisconnect):
             with client.websocket_connect("/ws/live",headers={"origin":"null"}):pass
+        for origin in ("http://127.0.0.1:1","http://localhost:65535","http://testserver"):
+            with pytest.raises(WebSocketDisconnect) as mismatched:
+                with client.websocket_connect("/ws/live",headers={"origin":origin}):pass
+            assert mismatched.value.code==1008
+        with client.websocket_connect(
+            "/ws/live",headers={"host":"127.0.0.1:8765","origin":"http://127.0.0.1:8765"},
+        ) as ws:
+            assert ws.receive_json()["type"]=="ready"
+        with client.websocket_connect("/ws/live",headers={"origin":"http://127.0.0.1:5173"}) as ws:
+            assert ws.receive_json()["type"]=="ready"
         with pytest.raises(WebSocketDisconnect) as host_error:
             with client.websocket_connect("/ws/live",headers={"host":"evil.example"}):pass
         assert host_error.value.code==1008

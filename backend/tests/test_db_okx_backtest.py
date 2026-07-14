@@ -14,6 +14,31 @@ from backend.okx import OKXError,OKXPublicClient
 def c(ts,confirm=True):return Candle(timestamp=ts,open=1,high=2,low=.5,close=1.5,volume=10,timeframe="1H",confirm=confirm)
 
 
+@pytest.mark.parametrize("kwargs",[
+    {"base_url":"http://www.okx.com"},
+    {"base_url":"https://www.okx.com.evil.test"},
+    {"base_url":"https://www.okx.com:443"},
+    {"base_url":"https://user@www.okx.com"},
+    {"ws_url":"wss://ws.okx.com:8443/ws/v5/private"},
+    {"ws_url":"wss://evil.test:8443/ws/v5/public"},
+    {"business_ws_url":"wss://ws.okx.com:8443/ws/v5/public"},
+])
+def test_okx_client_rejects_nonofficial_or_private_endpoints(kwargs):
+    with pytest.raises(ValueError):
+        OKXPublicClient(**kwargs)
+
+
+def test_okx_client_accepts_only_the_official_public_market_endpoints():
+    client=OKXPublicClient(
+        base_url="https://www.okx.com/",
+        ws_url="wss://ws.okx.com:8443/ws/v5/public",
+        business_ws_url="wss://ws.okx.com:8443/ws/v5/business",
+    )
+    assert client.base_url=="https://www.okx.com"
+    assert client.ws_url.endswith("/ws/v5/public")
+    assert client.business_ws_url.endswith("/ws/v5/business")
+
+
 def test_db_dedupe_order_and_settings(tmp_path):
     db=Database(tmp_path/"x.db");db.upsert_candles("X",[c(2),c(1),c(2)])
     assert [x.timestamp for x in db.candles("X","1H")]==[1,2]
@@ -163,6 +188,19 @@ async def test_bulk_funding_rejects_response_driven_untrusted_url(monkeypatch):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("url",[
+    "https://static.okx.com:4443/a.zip",
+    "https://user@static.okx.com/a.zip",
+])
+async def test_bulk_funding_rejects_nonstandard_port_and_userinfo(monkeypatch,url):
+    client=OKXPublicClient()
+    async def fake_get(*args,**kwargs):return [{"url":url}]
+    monkeypatch.setattr(client,"_get",fake_get)
+    with pytest.raises(OKXError,match="untrusted"):
+        await client.bulk_funding_history(1,2)
+
+
+@pytest.mark.asyncio
 async def test_bulk_funding_rejects_oversized_download_before_body(monkeypatch):
     client=OKXPublicClient()
     async def fake_get(*args,**kwargs):return [{"url":"https://static.okx.com/a.zip"}]
@@ -170,6 +208,7 @@ async def test_bulk_funding_rejects_oversized_download_before_body(monkeypatch):
 
     class Response:
         url=type("URL",(),{"scheme":"https","host":"static.okx.com"})()
+        is_redirect=False
         headers={"content-length":str(client.MAX_DOWNLOAD_BYTES+1)}
         async def __aenter__(self):return self
         async def __aexit__(self,*args):pass
@@ -182,6 +221,32 @@ async def test_bulk_funding_rejects_oversized_download_before_body(monkeypatch):
         def stream(self,*args,**kwargs):return Response()
     monkeypatch.setattr("backend.okx.httpx.AsyncClient",lambda **kwargs:FakeHTTPClient())
     with pytest.raises(OKXError,match="size limit"):
+        await client.bulk_funding_history(1,2)
+
+
+@pytest.mark.asyncio
+async def test_bulk_funding_rejects_redirect_without_following_it(monkeypatch):
+    client=OKXPublicClient()
+    async def fake_get(*args,**kwargs):return [{"url":"https://static.okx.com/a.zip"}]
+    monkeypatch.setattr(client,"_get",fake_get)
+
+    class Response:
+        url=type("URL",(),{"scheme":"https","host":"static.okx.com"})()
+        is_redirect=True
+        headers={"location":"https://evil.test/a.zip"}
+        async def __aenter__(self):return self
+        async def __aexit__(self,*args):pass
+        def raise_for_status(self):raise AssertionError("redirect must be rejected first")
+        async def aiter_bytes(self):
+            raise AssertionError("redirect body must not be read")
+    class FakeHTTPClient:
+        def __init__(self,**kwargs):
+            assert kwargs["follow_redirects"] is False
+        async def __aenter__(self):return self
+        async def __aexit__(self,*args):pass
+        def stream(self,*args,**kwargs):return Response()
+    monkeypatch.setattr("backend.okx.httpx.AsyncClient",FakeHTTPClient)
+    with pytest.raises(OKXError,match="redirects are not allowed"):
         await client.bulk_funding_history(1,2)
 
 
@@ -219,6 +284,33 @@ async def test_stream_survives_bad_frame_and_handler_error(monkeypatch):
     client=OKXPublicClient()
     await asyncio.wait_for(client._stream_endpoint(client.ws_url,[],"public",handler,stop),1)
     assert events.count("message_error")==2
+
+
+@pytest.mark.asyncio
+async def test_stream_disables_redirects_and_pins_the_official_socket(monkeypatch):
+    stop=asyncio.Event(); captured={}
+    valid=json.dumps({"arg":{"channel":"tickers"},"data":[{"last":"100","ts":str(int(time.time()*1000))}]})
+    class Connector:
+        process_redirect=None
+        async def __aenter__(self):return self
+        async def __aexit__(self,*args):pass
+        async def send(self,value):pass
+        def __aiter__(self):
+            async def frames():yield valid
+            return frames()
+    connector=Connector()
+    def connect(url,**kwargs):
+        captured.update({"url":url,**kwargs})
+        return connector
+    monkeypatch.setattr("backend.okx.websockets.connect",connect)
+    async def handler(message):
+        if "data" in message:stop.set()
+    client=OKXPublicClient()
+    await client._stream_endpoint(client.ws_url,[],"public",handler,stop)
+    redirect=RuntimeError("redirect")
+    assert connector.process_redirect(redirect) is redirect
+    assert captured["url"]==client.ws_url
+    assert captured["host"]=="ws.okx.com" and captured["port"]==8443
 
 
 @pytest.mark.asyncio
