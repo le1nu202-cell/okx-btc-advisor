@@ -2,8 +2,11 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { FormEvent, ReactNode } from 'react'
 import { AlertTriangle, CheckCircle2, ChevronRight, LoaderCircle, RefreshCw, Save, ShieldAlert, Wifi, WifiOff } from 'lucide-react'
 import TradingPlanChart from './components/TradingPlanChart'
+import MarketSummaryCard from './components/MarketSummaryCard'
 import type { ChartTimeframe } from './chart-adapter'
 import { normalizeCandle } from './api'
+import { marketAnalysisApi, normalizeMarketAnalysis } from './market-analysis-api'
+import type { MarketAnalysis } from './market-analysis-types'
 import { workbenchApi } from './workbench-api'
 import { ACTION_LABELS, STATE_LABELS, canonicalExecutionState, isTerminalState, legalActionsForState, prefillForAction, priceOrderError, toInputNumber } from './workbench-utils'
 import { DEFAULT_PLAN, normalizeTradePlanDraft } from './workbench-types'
@@ -39,7 +42,11 @@ const CANDLE_LIMITS: Record<MarketTimeframe, number> = { '1m': 10_080, '15m': 8_
 const isMarketTimeframe = (value: unknown): value is MarketTimeframe => value === '1m' || value === '15m' || value === '1H' || value === '4H'
 export const mergeRealtimeCandles = (existing: Candle[], incoming: Candle[], limit: number) => {
   const merged = new Map(existing.map(candle => [candle.timestamp, candle]))
-  for (const candle of incoming) merged.set(candle.timestamp, candle)
+  for (const candle of incoming) {
+    const previous = merged.get(candle.timestamp)
+    if (previous?.confirm === true && candle.confirm !== true) continue
+    merged.set(candle.timestamp, candle)
+  }
   return [...merged.values()].sort((left, right) => left.timestamp - right.timestamp).slice(-limit)
 }
 const withRealtimeCandles = (current: MarketSnapshot, timeframe: MarketTimeframe, incoming: Candle[], gapDetected: boolean): MarketSnapshot => {
@@ -303,11 +310,12 @@ function AdvancedDetails({ risk, record }: { risk: RiskCalculation | null; recor
   </details>
 }
 
-export default function WorkbenchView() {
+export default function WorkbenchView({ onOpenMarketAnalysis }: { onOpenMarketAnalysis?: () => void } = {}) {
   const [snapshot, setSnapshot] = useState<MarketSnapshot>(EMPTY_SNAPSHOT)
   const [record, setRecord] = useState<TradePlanRecord>(EMPTY_RECORD)
   const [draft, setDraft] = useState<TradePlanDraft>(DEFAULT_PLAN)
   const [risk, setRisk] = useState<RiskCalculation | null>(null)
+  const [marketAnalysis, setMarketAnalysis] = useState<MarketAnalysis | null>(null)
   const [timeframe, setTimeframe] = useState<ChartTimeframe>('1H')
   const [loading, setLoading] = useState(true)
   const [saving, setSaving] = useState(false)
@@ -335,6 +343,11 @@ export default function WorkbenchView() {
   }, [applyRecord])
 
   useEffect(() => { void load() }, [load])
+  useEffect(() => {
+    let active = true
+    marketAnalysisApi.current().then(value => { if (active) setMarketAnalysis(value) }).catch(() => undefined)
+    return () => { active = false }
+  }, [])
   useEffect(() => {
     latestDraft.current = draft
     const timer = window.setTimeout(() => {
@@ -380,6 +393,9 @@ export default function WorkbenchView() {
           if (message.type === 'candle' && isMarketTimeframe(message.timeframe) && Array.isArray(message.candles)) {
             const candles = message.candles.map(normalizeCandle).filter((candle): candle is Candle => candle != null)
             if (candles.length) setSnapshot(current => withRealtimeCandles(current, message.timeframe as MarketTimeframe, candles, Boolean(message.gapDetected)))
+          }
+          if (message.type === 'marketAnalysis' && message.analysis && typeof message.analysis === 'object') {
+            setMarketAnalysis(normalizeMarketAnalysis(message.analysis))
           }
           if (message.type === 'riskParameters') {
             workbenchApi.calculate(latestDraft.current).then(value => setRisk(value)).catch(() => undefined)
@@ -461,6 +477,8 @@ export default function WorkbenchView() {
       <div className={`v05-core-card ${liquidationDanger(activeLiquidation) ? 'danger' : ''}`}><span>{hasActualFills ? '实际估算强平价' : '计划估算强平价'}</span><strong>{liquidationAvailable(activeLiquidation) ? `${money(activeLiquidation.estimatedLiquidationPrice)} USDT` : '不可用'}</strong><small>{liquidationDistanceAvailable(activeLiquidation) ? `距标记价 ${percent(activeLiquidation.distancePercent)} · ${activeLiquidation.distanceRisk}` : activeLiquidation?.warnings?.find(message => message.includes('标记价格')) ?? activeLiquidation?.errors?.[0] ?? '标记价距离不可用'}</small><small>参数 {activeLiquidation?.parameterSource ?? 'UNAVAILABLE'} · 更新 {time(activeLiquidation?.parametersUpdatedAt)}</small></div>
       <div className="v05-core-card actual"><span>{hasActualFills ? '实际剩余数量' : '计划总数量'}</span><strong>{quantity(hasActualFills ? execution?.remainingQuantityBtc : currentRisk?.totalQuantityBtc)} BTC</strong><small>{hasActualFills ? '来自人工确认成交' : '尚无实际成交，明确显示计划量'}</small></div>
     </section>
+
+    <MarketSummaryCard analysis={marketAnalysis} onOpen={() => onOpenMarketAnalysis?.()}/>
 
     <p className="v05-estimate-disclaimer">本工具没有读取OKX账户，强平价为基于当前输入和公开规则的估算，以OKX实际显示为准。</p>
     <p className="v05-estimate-assumptions">估算假设：只存在 BTC-USDT-SWAP 这一项全仓仓位；没有其他全仓或逐仓仓位影响账户权益；没有待成交挂单占用保证金；没有未知账户级费用或资产折算。实际强平以 OKX 标记价格和账户页面为准；工具未读取账户来核实这些条件。</p>

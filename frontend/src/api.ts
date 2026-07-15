@@ -30,11 +30,14 @@ function normalizeCandleStatus(value: unknown, candles: Record<MarketTimeframe, 
     const candidate = raw[timeframe]
     const row = candidate && typeof candidate === 'object' ? candidate as Record<string, unknown> : {}
     const latest = candles[timeframe].at(-1)?.timestamp ?? null
+    const latestConfirmed = [...candles[timeframe]].reverse().find(candle => candle.confirm === true)?.timestamp ?? null
+    const lastConfirmedAt = epoch(row.lastConfirmedAt) ?? latestConfirmed
     return [timeframe, {
       available: row.available == null ? candles[timeframe].length > 0 : Boolean(row.available),
       stale: row.stale == null ? false : Boolean(row.stale),
       lastAt: epoch(row.lastAt) ?? latest,
-      lastConfirmedAt: epoch(row.lastConfirmedAt),
+      lastConfirmedAt,
+      confirmedStale: row.confirmedStale == null ? undefined : Boolean(row.confirmedStale),
       gapDetected: Boolean(row.gapDetected),
     }]
   })) as Record<MarketTimeframe, CandleTimeframeStatus>

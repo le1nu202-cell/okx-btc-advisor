@@ -2,6 +2,8 @@ import os
 import tempfile
 import uuid
 import asyncio
+import time
+from concurrent.futures import ThreadPoolExecutor
 import pytest
 os.environ["OKX_DISABLE_NETWORK"]="1"
 os.environ["OKX_ADVISOR_DB"]=os.path.join(tempfile.gettempdir(),f"okx-advisor-{uuid.uuid4()}.db")
@@ -20,11 +22,181 @@ def test_health_and_camel_case_contract():
         health=client.get("/api/health")
         assert health.status_code==200
         assert health.json()["appId"]=="okx-btc-advisor"
-        assert health.json()["version"]=="0.5.0" and health.json()["instrument"]=="BTC-USDT-SWAP"
+        assert health.json()["version"]=="0.6.0" and health.json()["instrument"]=="BTC-USDT-SWAP"
         body=client.get("/api/market/snapshot").json()
         assert "candles1H" in body and "connectionStatus" in body and "fundingRate" in body
         missing=client.get("/api/not-a-real-endpoint")
         assert missing.status_code==404 and missing.headers["content-type"].startswith("application/json")
+
+
+def _market_analysis_fixture(status="STALE"):
+    return {
+        "instrument":"BTC-USDT-SWAP","overallBias":"SHORT_BIAS","actionContext":"WAIT",
+        "compositeScore":-40.0,"trendStrength":55.0,"alignmentScore":72.0,"confidence":40.0,
+        "primaryReason":"4H 与 1H 同向偏空","summary":"偏空，但等待短周期反弹结束",
+        "invalidationLevel":101.0,"nearestSupport":95.0,"nearestResistance":101.0,
+        "timeframeAnalyses":{},"supportingReasons":[],"conflictingReasons":[],"riskWarnings":[],
+        "keyLevels":{"supports":[],"resistances":[]},"chartSeries":{},
+        "dataQuality":{"status":status,"warnings":[]},"asOf":1_800_000_000_000,
+        "modelVersion":"indicator-regime-v06.0.0",
+    }
+
+
+def test_market_analysis_current_history_and_validation_contract(monkeypatch):
+    fixture=_market_analysis_fixture()
+    monkeypatch.setattr(main,"current_market_analysis",lambda **kwargs:fixture)
+    monkeypatch.setattr(main.db,"market_analysis_history",lambda *args:[{**fixture,"snapshotSource":"LIVE_OBSERVED"}])
+    report={"status":"EXPLORATORY_ONLY","validationPass":False,"modelVersion":"indicator-regime-v06.0.0","sampleCount":40}
+    monkeypatch.setattr(main,"build_validation_report",lambda *args,**kwargs:report)
+    monkeypatch.setitem(main.runtime,"market_analysis_validation",None)
+    monkeypatch.setitem(main.runtime,"market_analysis_validation_key",None)
+    with TestClient(app) as client:
+        current=client.get("/api/market-analysis/current")
+        history=client.get("/api/market-analysis/history?limit=10")
+        validation=client.get("/api/market-analysis/validation")
+    assert current.status_code==200 and current.json()["modelVersion"]=="indicator-regime-v06.0.0"
+    assert history.status_code==200 and history.json()["items"][0]["snapshotSource"]=="LIVE_OBSERVED"
+    assert validation.status_code==200 and validation.json()["validationPass"] is False
+
+
+@pytest.mark.asyncio
+async def test_market_analysis_websocket_payload_is_published(monkeypatch):
+    sent=[];fixture=_market_analysis_fixture("NORMAL")
+    monkeypatch.setitem(main.runtime,"market_analysis",None)
+    monkeypatch.setattr(main,"current_market_analysis",lambda **kwargs:fixture)
+    monkeypatch.setattr(main,"_persist_market_analysis",lambda *args,**kwargs:True)
+    async def capture(payload):sent.append(payload)
+    monkeypatch.setattr(main,"broadcast",capture)
+    await main.publish_market_analysis(trigger="15m_CLOSE",persist=True)
+    assert sent==[{"type":"marketAnalysis","analysis":fixture,"trigger":"15m_CLOSE","persisted":True}]
+
+
+def test_validation_cache_signature_ignores_intermediate_1m_closes(tmp_path,monkeypatch):
+    local=Database(tmp_path/"validation-cache.db")
+    base=1_800_000_000_000
+    for timeframe,duration in (("1m",60_000),("15m",900_000),("1H",3_600_000),("4H",14_400_000)):
+        timestamp=base//duration*duration
+        local.upsert_candles(main.INSTRUMENT,[Candle(timestamp=timestamp,open=100,high=101,low=99,close=100,volume=1,timeframe=timeframe,confirm=True)])
+    monkeypatch.setattr(main,"db",local)
+    before=main._market_validation_signature()
+    latest_fifteen=base//900_000*900_000
+    one_minute=latest_fifteen+900_000
+    local.upsert_candles(main.INSTRUMENT,[Candle(timestamp=one_minute,open=100,high=101,low=99,close=100,volume=1,timeframe="1m",confirm=True)])
+    assert main._market_validation_signature()==before
+    older_one=base//60_000*60_000
+    local.upsert_candles(main.INSTRUMENT,[Candle(timestamp=older_one,open=100,high=102,low=98,close=101,volume=2,timeframe="1m",confirm=True)])
+    assert main._market_validation_signature()!=before
+    corrected=main._market_validation_signature()
+    fifteen=latest_fifteen+900_000
+    local.upsert_candles(main.INSTRUMENT,[Candle(timestamp=fifteen,open=100,high=101,low=99,close=100,volume=1,timeframe="15m",confirm=True)])
+    assert main._market_validation_signature()!=corrected
+    advanced=main._market_validation_signature()
+    older=base//900_000*900_000
+    local.upsert_candles(main.INSTRUMENT,[Candle(timestamp=older,open=100,high=102,low=98,close=101,volume=2,timeframe="15m",confirm=True)])
+    assert main._market_validation_signature()!=advanced
+
+
+def test_market_analysis_cache_recomputes_when_clock_crosses_a_missing_close(tmp_path,monkeypatch):
+    local=Database(tmp_path/"analysis-freshness.db")
+    now=[1_800_000_030_000]
+    rows=[]
+    for timeframe in main.CHART_TIMEFRAMES:
+        duration=int(main.CANDLE_TIMEFRAMES[timeframe]["durationMs"])
+        timestamp=(now[0]//duration)*duration-duration
+        rows.append(Candle(timestamp=timestamp,open=100,high=101,low=99,close=100,volume=1,timeframe=timeframe,confirm=True))
+    local.upsert_candles(main.INSTRUMENT,rows)
+    calls=[]
+    def build(*args,**kwargs):
+        calls.append(kwargs["decision_at"])
+        return {"decisionAt":kwargs["decision_at"],"dataQuality":{"status":"AVAILABLE"}}
+    monkeypatch.setattr(main,"db",local)
+    monkeypatch.setattr(main,"build_market_analysis",build)
+    monkeypatch.setattr(main.time,"time",lambda:now[0]/1000)
+    monkeypatch.setitem(main.runtime,"market_analysis",None)
+    monkeypatch.setitem(main.runtime,"market_analysis_signature",None)
+    main.current_market_analysis()
+    main.current_market_analysis()
+    assert len(calls)==1
+    now[0]+=60_000
+    main.current_market_analysis()
+    assert len(calls)==2
+
+
+def test_market_signature_changes_when_early_confirmed_candle_becomes_eligible(tmp_path,monkeypatch):
+    local=Database(tmp_path/"analysis-early-confirm.db")
+    now=1_800_000_030_000
+    for timeframe in main.CHART_TIMEFRAMES:
+        duration=int(main.CANDLE_TIMEFRAMES[timeframe]["durationMs"])
+        timestamp=(now//duration)*duration-duration
+        local.upsert_candles(main.INSTRUMENT,[Candle(timestamp=timestamp,open=100,high=101,low=99,close=100,volume=1,timeframe=timeframe,confirm=True)])
+    future_open=(now//60_000)*60_000
+    local.upsert_candles(main.INSTRUMENT,[Candle(timestamp=future_open,open=100,high=101,low=99,close=100,volume=2,timeframe="1m",confirm=True)])
+    monkeypatch.setattr(main,"db",local)
+    before_close=main._market_analysis_signature(now)
+    after_close=main._market_analysis_signature(now+60_000)
+    assert before_close!=after_close
+
+
+def test_market_analysis_concurrent_calls_share_one_cache_build(monkeypatch):
+    calls=[]
+    monkeypatch.setattr(main,"_market_analysis_signature",lambda:("fixed",))
+    monkeypatch.setattr(main.db,"candles",lambda *args,**kwargs:[])
+    def build(*args,**kwargs):
+        calls.append(kwargs["decision_at"])
+        time.sleep(.05)
+        return {"decisionAt":kwargs["decision_at"],"dataQuality":{"status":"AVAILABLE"}}
+    monkeypatch.setattr(main,"build_market_analysis",build)
+    monkeypatch.setitem(main.runtime,"market_analysis",None)
+    monkeypatch.setitem(main.runtime,"market_analysis_signature",None)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results=list(pool.map(lambda _:main.current_market_analysis(),range(2)))
+    assert len(calls)==1
+    assert results[0]==results[1]
+
+
+def test_market_signatures_detect_same_timestamp_confirmed_corrections(tmp_path,monkeypatch):
+    local=Database(tmp_path/"analysis-correction.db")
+    now=1_800_000_030_000
+    for timeframe in main.CHART_TIMEFRAMES:
+        duration=int(main.CANDLE_TIMEFRAMES[timeframe]["durationMs"])
+        timestamp=(now//duration)*duration-duration
+        local.upsert_candles(main.INSTRUMENT,[Candle(timestamp=timestamp,open=100,high=101,low=99,close=100,volume=1,timeframe=timeframe,confirm=True)])
+    monkeypatch.setattr(main,"db",local)
+    analysis_before=main._market_analysis_signature(now)
+    validation_before=main._market_validation_signature()
+    timestamp=(now//900_000)*900_000-900_000
+    local.upsert_candles(main.INSTRUMENT,[Candle(timestamp=timestamp,open=100,high=102,low=98,close=101,volume=2,timeframe="15m",confirm=True)])
+    assert main._market_analysis_signature(now)!=analysis_before
+    assert main._market_validation_signature()!=validation_before
+
+
+def test_market_analysis_current_get_is_read_only(monkeypatch):
+    fixture=_market_analysis_fixture("NORMAL")
+    persisted=[]
+    monkeypatch.setattr(main,"current_market_analysis",lambda **kwargs:fixture)
+    monkeypatch.setattr(main,"_persist_market_analysis",lambda *args,**kwargs:persisted.append((args,kwargs)))
+    with TestClient(app) as client:
+        response=client.get("/api/market-analysis/current")
+    assert response.status_code==200
+    assert persisted==[]
+
+
+def test_market_validation_concurrent_requests_share_one_build(monkeypatch):
+    calls=[]
+    monkeypatch.setattr(main,"_market_validation_signature",lambda:("fixed",))
+    monkeypatch.setattr(main.db,"candles_since",lambda *args,**kwargs:[])
+    def build(*args,**kwargs):
+        calls.append(kwargs["generated_at"])
+        time.sleep(.05)
+        return {"status":"COMPLETE","validationPass":False,"generatedAt":kwargs["generated_at"]}
+    monkeypatch.setattr(main,"build_validation_report",build)
+    monkeypatch.setitem(main.runtime,"market_analysis_validation",None)
+    monkeypatch.setitem(main.runtime,"market_analysis_validation_key",None)
+    monkeypatch.setitem(main.runtime,"market_analysis_validation_at",0)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results=list(pool.map(lambda _:main.market_analysis_validation(),range(2)))
+    assert len(calls)==1
+    assert results[0]==results[1]
 
 
 def test_loopback_host_validation_and_security_headers():
@@ -191,6 +363,10 @@ def test_snapshot_never_uses_unconfirmed_future_close_as_observation_time(tmp_pa
     value=main.snapshot()
     expected=datetime.fromtimestamp(hour/1000,timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     assert value.updated_at==expected and value.candles_1h[-1].confirm is False
+    assert value.candle_status["1H"].last_confirmed_at==hour-3_600_000
+    # The last confirmed candle closed at the current hour boundary, so it is
+    # still the expected decision candle while the new hour is forming.
+    assert value.candle_status["1H"].confirmed_stale is False
     assert value.stale is True
 
 
@@ -213,6 +389,27 @@ async def test_live_ticker_rejects_nonfinite_future_and_time_regression(monkeypa
     assert main.runtime["price"]==100.0 and main.runtime["ticker_ts"]==now
     await main.on_okx({"arg":{"channel":"tickers"},"data":[{"last":"101","ts":str(now+1)}]})
     assert main.runtime["price"]==101.0 and main.runtime["ticker_ts"]==now+1
+
+
+@pytest.mark.asyncio
+async def test_replayed_confirmed_ws_candle_does_not_request_duplicate_snapshot(monkeypatch):
+    timeframe="15m";step=int(main.CANDLE_TIMEFRAMES[timeframe]["durationMs"])
+    channel=next(name for name,value in main.CHANNEL_TO_TIMEFRAME.items() if value==timeframe)
+    previous=Candle(timestamp=1_800_000_000_000,open=100,high=101,low=99,close=100,volume=1,timeframe=timeframe,confirm=True)
+    received=[previous];published=[]
+    monkeypatch.setattr(main.client,"parse_candles",lambda *args,**kwargs:list(received))
+    monkeypatch.setattr(main.db,"candles",lambda *args,**kwargs:[previous])
+    monkeypatch.setattr(main.db,"upsert_candles",lambda *args,**kwargs:None)
+    monkeypatch.setattr(main,"_refresh_candle_gap_status",lambda *args,**kwargs:False)
+    async def capture_market(**kwargs):published.append(kwargs["persist"]);return {}
+    async def ignore(*args,**kwargs):return None
+    monkeypatch.setattr(main,"publish_market_analysis",capture_market)
+    monkeypatch.setattr(main,"broadcast",ignore)
+
+    await main.on_okx({"arg":{"channel":channel},"data":[{}]})
+    received[0]=previous.model_copy(update={"timestamp":previous.timestamp+step})
+    await main.on_okx({"arg":{"channel":channel},"data":[{}]})
+    assert published==[False,True]
 
 
 @pytest.mark.asyncio
@@ -260,6 +457,32 @@ async def test_periodic_rest_reconciliation_repairs_silent_candle_channels(monke
     monkeypatch.setattr(main.db,"upsert_candles",lambda instrument,value,retention_before=None:stored.extend(value))
     assert await main.reconcile_market_once() is True
     assert {item.timeframe for item in stored}=={"1m","15m","1H","4H"} and published==[True]
+
+
+@pytest.mark.asyncio
+async def test_rest_reconciliation_persists_only_a_new_confirmed_decision_close(monkeypatch):
+    base=1_800_000_000_000
+    previous={
+        timeframe:Candle(timestamp=(base//int(main.CANDLE_TIMEFRAMES[timeframe]["durationMs"]))*int(main.CANDLE_TIMEFRAMES[timeframe]["durationMs"]),open=100,high=101,low=99,close=100,volume=1,timeframe=timeframe,confirm=True)
+        for timeframe in main.CHART_TIMEFRAMES
+    }
+    advanced=[False];published=[]
+    monkeypatch.setattr(main.db,"candles",lambda instrument,timeframe,limit:[previous[timeframe]])
+    async def rows(instrument,timeframe,limit,history):
+        row=previous[timeframe]
+        if advanced[0] and timeframe=="15m":
+            row=row.model_copy(update={"timestamp":row.timestamp+int(main.CANDLE_TIMEFRAMES[timeframe]["durationMs"])})
+        return [row]
+    monkeypatch.setattr(main.client,"candles",rows)
+    monkeypatch.setattr(main.db,"upsert_candles",lambda *args,**kwargs:None)
+    monkeypatch.setattr(main,"_refresh_candle_gap_status",lambda *args,**kwargs:False)
+    monkeypatch.setattr(main,"publish_current_signal",lambda:asyncio.sleep(0,result=False))
+    async def publish(**kwargs):published.append(kwargs["persist"]);return {}
+    monkeypatch.setattr(main,"publish_market_analysis",publish)
+    assert await main.reconcile_market_once() is True
+    advanced[0]=True
+    assert await main.reconcile_market_once() is True
+    assert published==[False,True]
 
 
 @pytest.mark.asyncio

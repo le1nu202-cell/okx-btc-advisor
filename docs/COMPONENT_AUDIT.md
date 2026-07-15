@@ -1,6 +1,6 @@
 # Frontend Component Audit
 
-审计日期：2026-07-14
+审计日期：2026-07-15
 
 ## TradingView Lightweight Charts
 
@@ -54,3 +54,41 @@
 ## 测试组件
 
 为替换源码正则式验证，本版本增加 Vitest 4.1.10、React Testing Library 16.3.2、Testing Library DOM 10.4.1、user-event 14.6.1 与 jsdom 29.1.1。它们均为 MIT 许可证，与 React 19、Vite 8 和 Node 24 兼容。测试覆盖适配器确定性输出、真实 React 交互、图表实例清理、表单校验和执行状态/提醒状态分离。
+
+## v0.6 市场分析组件
+
+模型版本固定为 `indicator-regime-v06.0.0`。该功能是现有工作台和旧研究区之外的解释层，没有替换风险引擎、人工成交状态机、旧策略或旧回测。
+
+后端边界：
+
+- `backend/market_regime.py`：严格 point-in-time 清洗、七组单周期方向贡献、六项趋势强度、结构和波动状态。
+- `backend/market_levels.py`：已确认 swing、前日高低、日/周开盘、日/周 VWAP、POC/VAH/VAL 与 ATR 聚类。
+- `backend/market_analysis.py`：4H/1H/15m/1m 聚合、硬冲突、alignment、confidence、NO_CHASE、前端覆盖层和紧凑快照。
+- `backend/market_validation.py`：15m 决策网格上的历史重建、60/40 切分、24h purge 和 HAC 探索性统计。
+- `backend/db.py`：不可变 `market_analysis_snapshots`，按内容哈希幂等，`LIVE_OBSERVED` 保留 180 天。
+- `backend/main.py`：`/api/market-analysis/current`、`history`、`validation` 和 `/ws/live` 的 `marketAnalysis` 推送。
+
+前端边界：
+
+- `frontend/src/MarketAnalysisView.tsx`：完整市场分析页面、四周期卡片、验证声明和历史趋势。
+- `frontend/src/components/MarketAnalysisChart.tsx`：复用 Lightweight Charts 显示 MarketSnapshot 蜡烛与后端 EMA/VWAP 覆盖层，不在浏览器重算指标。
+- `frontend/src/components/MarketSummaryCard.tsx`：工作台只读摘要，不改变计划、实际成交、提醒或执行状态。
+- `frontend/src/components/TimeframeAnalysisCard.tsx`、`IndicatorContributionList.tsx`、`KeyLevelPanel.tsx`、`AnalysisHistoryChart.tsx`：分别负责单周期解释、七组贡献、关键位和已保存观察历史。
+- `frontend/src/market-analysis-api.ts` 与 `market-analysis-types.ts`：独立归一化和 TypeScript 契约；无效有限值不会进入图表。
+
+## v0.6 数据与生命周期审计
+
+- 所有指标只使用 `confirm=true` 且 `timestamp + timeframe <= decisionAt` 的 K 线。
+- Swing 使用左右各 2 根确认；缺失、过期、冲突重复、非法 OHLCV 和运行时缺口都会降级。
+- 单周期七组权重严格为 `30/20/15/10/10/5/10`，多周期权重为 `4H 0.40 / 1H 0.35 / 15m 0.20 / 1m 0.05`。
+- 趋势强度六项为 `ADX 30% / EMA斜率 20% / 结构持续性 20% / 突破持续性 10% / 成交量确认 10% / 波动支持 10%`，ADX 不进入方向分。
+- 图表覆盖层来自后端已收盘数据；原始 OHLC 继续来自现有 MarketSnapshot，避免出现第二套行情事实源。
+- 1m 只保留 7 天、15m 只保留 90 天；180 天仅指紧凑分析快照。早期历史验证缺少 1m 时明确降级。
+- NO_CHASE 只提供操作上下文和具体原因，不改方向分，也不触发真实成交或自动交易。
+- 验证只有一次 60/40 时间切分和单一 OOS 区间，`validationPass=false`；组件不得展示“已验证”或胜率保证。
+
+## v0.6 依赖审计
+
+本轮没有修改 `requirements.txt`、`frontend/package.json` 或 `frontend/pnpm-lock.yaml`，没有新增运行时或测试依赖。指标继续使用仓库已有 NumPy 和 `backend.indicators`，图表继续使用已审计的 Lightweight Charts 5.2.0。
+
+Jesse（MIT）和 CryptoSignal（MIT）用于研究模块边界与指标解释方式的设计参考；Freqtrade（GPL-3.0）和 VectorBT（Apache-2.0 with Commons Clause）只作为验证、数据质量和回测方法的设计参考。本仓库没有复制这些项目的源代码、没有链接或导入其包，也没有将它们加入依赖锁文件。详见 `THIRD_PARTY_NOTICES.md`。

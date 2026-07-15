@@ -197,6 +197,8 @@ def test_snapshot_exposes_independent_availability_staleness_timestamp_and_gap_f
         "available": True,
         "stale": False,
         "lastAt": now - 60_000,
+        "lastConfirmedAt": now - 60_000,
+        "confirmedStale": False,
         "gapDetected": True,
     }
     assert body["candleStatus"]["15m"]["available"] is True

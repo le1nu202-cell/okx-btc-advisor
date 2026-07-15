@@ -10,7 +10,7 @@ import {
 import type { AutoscaleInfoProvider, IChartApi, IPriceLine, ISeriesApi, ISeriesMarkersPluginApi, Time } from 'lightweight-charts'
 import { buildActualFillMarkers, buildPlanPriceLines, CHART_TIMEFRAMES, toChartCandles } from '../chart-adapter'
 import type { ChartTimeframe } from '../chart-adapter'
-import type { Candle, CandleTimeframeStatus } from '../types'
+import { confirmedCandleIsStale, type Candle, type CandleTimeframeStatus } from '../types'
 import type { ActualFill, ActualFillKey, ExecutionRisk, RiskCalculation, TradePlanDraft } from '../workbench-types'
 
 export interface TradingPlanChartProps {
@@ -31,6 +31,9 @@ export interface TradingPlanChartProps {
 }
 
 const CHART_HEIGHT = 470
+const confirmedTime = (value: number | null | undefined) => value == null
+  ? '未知'
+  : new Date(value).toLocaleString('zh-CN', { hour12: false })
 
 export default function TradingPlanChart({
   candles1m = [],
@@ -194,13 +197,16 @@ export default function TradingPlanChart({
     onTimeframeChange?.(value)
   }
   const selectedStatus = candleStatus?.[selectedTimeframe]
+  const confirmedStale = confirmedCandleIsStale(selectedStatus, selectedTimeframe)
   const disconnected = connectionStatus !== 'connected'
   const unavailable = selectedStatus?.available === false || !chartCandles.length
   const dataWarning = unavailable
     ? `${selectedTimeframe} 暂无可用 K 线`
     : selectedStatus?.gapDetected
       ? `${selectedTimeframe} 检测到行情缺口，请谨慎参考`
-      : stale || selectedStatus?.stale
+      : confirmedStale
+        ? `${selectedTimeframe} 已收盘 K 线已过期（最新确认：${confirmedTime(selectedStatus?.lastConfirmedAt)}）；未收盘更新不代表可确认成交`
+        : stale || selectedStatus?.stale
         ? `${selectedTimeframe} 行情已过期，请勿据此确认成交`
         : disconnected ? `公共行情连接状态：${connectionStatus}` : ''
 

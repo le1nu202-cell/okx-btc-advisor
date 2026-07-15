@@ -8,7 +8,30 @@ export interface CandleTimeframeStatus {
   stale: boolean
   lastAt: number | null
   lastConfirmedAt?: number | null
+  confirmedStale?: boolean
   gapDetected: boolean
+}
+
+const CANDLE_DURATION_MS: Record<MarketTimeframe, number> = {
+  '1m': 60_000,
+  '15m': 15 * 60_000,
+  '1H': 60 * 60_000,
+  '4H': 4 * 60 * 60_000,
+}
+
+/** Match the backend rule: a confirmed candle is stale after two further
+ * timeframe durations have elapsed beyond that candle's close. Explicit
+ * backend state wins; the timestamp fallback also covers local WS merges. */
+export const confirmedCandleIsStale = (
+  status: CandleTimeframeStatus | null | undefined,
+  timeframe: MarketTimeframe,
+  now = Date.now(),
+) => {
+  if (!status || status.available === false) return false
+  if (status.confirmedStale != null) return status.confirmedStale
+  if (status.lastConfirmedAt == null) return true
+  const duration = CANDLE_DURATION_MS[timeframe]
+  return now - (status.lastConfirmedAt + duration) > 2 * duration
 }
 export interface MarketSnapshot {
   instrument: string; price: number | null; updatedAt: number | null; stale: boolean; connectionStatus: string;

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import math
 import sqlite3
 import threading
@@ -13,9 +14,10 @@ from typing import Iterable
 from .models import AdviceAction, Candle, Settings, SignalAdvice
 
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 OI_SAMPLE_BUCKET_MS = 5*60_000
 NEWS_SOURCE_CHECK_RETENTION_MS = 7*86400_000
+MARKET_ANALYSIS_RETENTION_MS = 180*86400_000
 
 
 def _reject_json_constant(value:str):
@@ -83,6 +85,16 @@ CREATE TABLE IF NOT EXISTS replay_sessions (
  payload TEXT NOT NULL, result TEXT, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_replay_sessions_updated ON replay_sessions(updated_at DESC);
+CREATE TABLE IF NOT EXISTS market_analysis_snapshots (
+ snapshot_id TEXT PRIMARY KEY, instrument TEXT NOT NULL,
+ decision_at INTEGER NOT NULL, generated_at INTEGER NOT NULL,
+ model_version TEXT NOT NULL, source TEXT NOT NULL, status TEXT NOT NULL,
+ payload_hash TEXT NOT NULL, payload TEXT NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_market_analysis_payload
+ ON market_analysis_snapshots(instrument,model_version,source,payload_hash);
+CREATE INDEX IF NOT EXISTS idx_market_analysis_decision
+ ON market_analysis_snapshots(instrument,model_version,source,decision_at DESC,generated_at DESC);
 """
 
 
@@ -187,6 +199,113 @@ class Database:
                 (instrument,timeframe,int(since)),
             ).fetchall()
         return [Candle(timestamp=r["ts"],open=r["open"],high=r["high"],low=r["low"],close=r["close"],volume=r["volume"],volume_ccy=r["volume_ccy"],confirm=bool(r["confirm"]),timeframe=r["timeframe"]) for r in rows]
+
+    def candle_series_signature(self, instrument: str, timeframe: str, confirmed_only: bool = True, through_ts: int | None = None) -> tuple:
+        """Return a cheap whole-series revision fingerprint for cache keys.
+
+        Separate aggregates make older backfills and same-timestamp OHLCV
+        corrections visible without materializing the full Pydantic candle
+        corpus merely to decide whether an expensive report is still valid.
+        """
+        where=" AND confirm=1" if confirmed_only else ""
+        params:list[object]=[instrument,timeframe]
+        if through_ts is not None:
+            where+=" AND ts<=?"
+            params.append(int(through_ts))
+        with self.session() as con:
+            row=con.execute(
+                "SELECT COUNT(*) AS n,MIN(ts) AS first_ts,MAX(ts) AS last_ts,SUM(ts) AS ts_sum,"
+                "SUM(open) AS open_sum,SUM(high) AS high_sum,SUM(low) AS low_sum,SUM(close) AS close_sum,"
+                "SUM(volume) AS volume_sum,SUM(COALESCE(volume_ccy,0)) AS volume_ccy_sum,"
+                "SUM(CASE WHEN volume_ccy IS NULL THEN 1 ELSE 0 END) AS volume_ccy_nulls,SUM(confirm) AS confirm_sum "
+                f"FROM candles WHERE instrument=? AND timeframe=?{where}",
+                tuple(params),
+            ).fetchone()
+        return tuple(row[key] for key in ("n","first_ts","last_ts","ts_sum","open_sum","high_sum","low_sum","close_sum","volume_sum","volume_ccy_sum","volume_ccy_nulls","confirm_sum"))
+
+    def save_market_analysis_snapshot(self, payload: dict, source: str = "LIVE_OBSERVED") -> bool:
+        """Persist an immutable, compact public-market analysis observation.
+
+        The content hash makes retries idempotent without overwriting a prior
+        point-in-time fact. Historical reconstructions use a separate source
+        and are not written by the live service.
+        """
+        if source not in {"LIVE_OBSERVED", "HISTORICAL_RECONSTRUCTED"}:
+            raise ValueError("invalid market analysis source")
+        instrument=str(payload.get("instrument") or "")
+        model_version=str(payload.get("modelVersion") or "")
+        decision_at=int(payload.get("asOf") or 0)
+        if not instrument or not model_version or decision_at<=0:
+            raise ValueError("market analysis snapshot identity is incomplete")
+        encoded=_json_dumps(payload)
+        # snapshotTrigger is transport/audit metadata, not a different market
+        # observation.  Excluding it prevents API/WS/reconcile retries from
+        # creating multiple rows for the same semantic point-in-time result.
+        semantic_payload={key:value for key,value in payload.items() if key!="snapshotTrigger"}
+        semantic_encoded=json.dumps(semantic_payload,ensure_ascii=False,allow_nan=False,sort_keys=True,separators=(",",":"))
+        payload_hash=hashlib.sha256(semantic_encoded.encode("utf-8")).hexdigest()
+        snapshot_id=f"{source}:{instrument}:{model_version}:{payload_hash}"
+        generated_at=int(time.time()*1000)
+        status=str((payload.get("dataQuality") or {}).get("status") or "UNKNOWN")
+        with self._lock,self.session() as con:
+            duplicate=False
+            # Compatibility with v0.6 development databases whose older hash
+            # included snapshotTrigger: compare same-time payloads semantically
+            # before relying on the new canonical hash.
+            prior=con.execute(
+                "SELECT payload FROM market_analysis_snapshots WHERE instrument=? AND model_version=? AND source=? AND decision_at=?",
+                (instrument,model_version,source,decision_at),
+            ).fetchall()
+            for row in prior:
+                try:
+                    prior_payload=_json_loads(row["payload"])
+                    prior_semantic={key:value for key,value in prior_payload.items() if key!="snapshotTrigger"}
+                    prior_encoded=json.dumps(prior_semantic,ensure_ascii=False,allow_nan=False,sort_keys=True,separators=(",",":"))
+                    if prior_encoded==semantic_encoded:
+                        duplicate=True
+                        break
+                except (TypeError,ValueError,json.JSONDecodeError):
+                    continue
+            cursor=None if duplicate else con.execute(
+                "INSERT OR IGNORE INTO market_analysis_snapshots("
+                "snapshot_id,instrument,decision_at,generated_at,model_version,source,status,payload_hash,payload"
+                ") VALUES(?,?,?,?,?,?,?,?,?)",
+                (snapshot_id,instrument,decision_at,generated_at,model_version,source,status,payload_hash,encoded),
+            )
+            if source=="LIVE_OBSERVED":
+                con.execute(
+                    "DELETE FROM market_analysis_snapshots WHERE source=? AND decision_at<?",
+                    (source,generated_at-MARKET_ANALYSIS_RETENTION_MS),
+                )
+        return bool(cursor is not None and cursor.rowcount)
+
+    def market_analysis_history(
+        self,
+        instrument: str,
+        model_version: str,
+        limit: int = 200,
+        source: str = "LIVE_OBSERVED",
+    ) -> list[dict]:
+        if source not in {"LIVE_OBSERVED", "HISTORICAL_RECONSTRUCTED"}:
+            raise ValueError("invalid market analysis source")
+        safe_limit=max(1,min(int(limit),500))
+        with self.session() as con:
+            rows=con.execute(
+                "SELECT payload,source,generated_at FROM market_analysis_snapshots "
+                "WHERE instrument=? AND model_version=? AND source=? "
+                "ORDER BY decision_at DESC,generated_at DESC LIMIT ?",
+                (instrument,model_version,source,safe_limit),
+            ).fetchall()
+        result=[]
+        for row in reversed(rows):
+            try:
+                value=_json_loads(row["payload"])
+                value["snapshotSource"]=row["source"]
+                value["generatedAt"]=row["generated_at"]
+                result.append(value)
+            except (TypeError,ValueError,json.JSONDecodeError):
+                continue
+        return result
 
     def upsert_funding(self, instrument: str, rows: Iterable[tuple[int,float]]) -> None:
         valid=[]
@@ -430,7 +549,7 @@ class Database:
             for table in (
                 "candles","funding","open_interest","signals","settings","backtests",
                 "news_items","news_source_checks","trade_plan_events","trade_plans",
-                "trade_logs","replay_sessions","public_market_cache",
+                "trade_logs","replay_sessions","public_market_cache","market_analysis_snapshots",
             ):
                 con.execute(f"DELETE FROM {table}")
 

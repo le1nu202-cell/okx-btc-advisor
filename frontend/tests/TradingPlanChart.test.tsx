@@ -219,6 +219,29 @@ describe('TradingPlanChart', () => {
     expect(screen.getByRole('status').textContent).toContain('reconnecting')
   })
 
+  it('未收盘行情仍新鲜但已确认 K 线过期时独立告警', () => {
+    const openCandle = { ...candles1h[1], confirm: false }
+    render(<TradingPlanChart
+      {...baseProps}
+      candles1h={[candles1h[0], openCandle]}
+      candleStatus={{
+        ...snapshot.candleStatus,
+        '1H': {
+          available: true,
+          stale: false,
+          lastAt: openCandle.timestamp,
+          lastConfirmedAt: candles1h[0].timestamp,
+          confirmedStale: true,
+          gapDetected: false,
+        },
+      }}
+    />)
+
+    const warning = screen.getByRole('status').textContent ?? ''
+    expect(warning).toContain('1H 已收盘 K 线已过期')
+    expect(warning).toContain('未收盘更新不代表可确认成交')
+  })
+
   it('所选周期不可用或有缺口时使用该周期独立状态', async () => {
     const user = userEvent.setup()
     render(<TradingPlanChart {...baseProps} candleStatus={{

@@ -26,6 +26,9 @@ from .db import Database
 from .models import AdviceAction, BacktestRequest, BacktestStatus, Candle, MarketRegime, MarketSnapshot, Settings, SignalAdvice
 from .news import NewsAggregator, aggregate_news
 from .liquidation import DEFAULT_MARK_PRICE_MAX_AGE_MS, actual_liquidation_estimate, planned_liquidation_scenarios
+from .market_analysis import MODEL_VERSION as MARKET_ANALYSIS_MODEL_VERSION
+from .market_analysis import analysis_changed_significantly, build_market_analysis, compact_analysis_snapshot
+from .market_validation import build_validation_report
 from .okx import ANALYSIS_TIMEFRAMES, CANDLE_TIMEFRAMES, CHANNEL_TO_TIMEFRAME, CHART_TIMEFRAMES, OKXPublicClient
 from .strategy import analyze, estimate_risk
 from .technical import analyze_technical
@@ -57,7 +60,7 @@ from .workbench import (
 
 INSTRUMENT="BTC-USDT-SWAP"
 APP_ID="okx-btc-advisor"
-APP_VERSION="0.5.0"
+APP_VERSION="0.6.0"
 MAX_WEBSOCKET_CONNECTIONS=32
 NEWS_POLL_SECONDS=300
 NEWS_SOURCE_STALE_MS=15*60_000
@@ -66,6 +69,10 @@ PUBLIC_RISK_REFRESH_MS=6*3600_000
 PUBLIC_RISK_MAX_STALE_MS=7*86400_000
 MARK_PRICE_STALE_MS=DEFAULT_MARK_PRICE_MAX_AGE_MS
 LIQUIDATION_REFRESH_MIN_INTERVAL_MS=1_000
+MARKET_ANALYSIS_INPUT_LIMIT=400
+MARKET_ANALYSIS_VALIDATION_CACHE_MS=15*60_000
+MARKET_ANALYSIS_VALIDATION_WINDOW=960
+MARKET_ANALYSIS_VALIDATION_STRIDE=4
 ROOT=Path(__file__).resolve().parents[1]
 db=Database(os.getenv("OKX_ADVISOR_DB",str(Path(__file__).with_name("data")/"advisor.db")))
 client=OKXPublicClient(base_url=os.getenv("OKX_BASE_URL","https://www.okx.com"),ws_url=os.getenv("OKX_WS_URL","wss://ws.okx.com:8443/ws/v5/public"),business_ws_url=os.getenv("OKX_BUSINESS_WS_URL","wss://ws.okx.com:8443/ws/v5/business"))
@@ -73,12 +80,14 @@ def _empty_news(message="新闻源正在连接"):
     return {"items":[],"analysis":{"asOf":None,"windowHours":48,"score":0,"articleCount":0,"status":"unavailable","sourceCoverage":0,"sourceStatus":[],"rawImpact":0,"coverageAdjustedImpact":0,"reason":"新闻数据不可用，严格按中性处理","warnings":[message]}}
 
 
-runtime={"price":None,"ticker_ts":None,"mark_price":None,"mark_price_ts":None,"connection":"starting","stream_status":{"public":"starting","candles":"starting"},"candle_gaps":{timeframe:False for timeframe in CHART_TIMEFRAMES},"candle_gap_targets":{timeframe:None for timeframe in CHART_TIMEFRAMES},"stop":None,"task":None,"bootstrap_task":None,"resync_task":None,"reconcile_task":None,"news_task":None,"intraday_backfill_task":None,"risk_parameter_task":None,"backtest_tasks":set(),"news":_empty_news(),"news_source_status":[],"news_checked":False,"news_last_success":None,"plan_check_ts":0,"liquidation_refresh_ts":0}
+runtime={"price":None,"ticker_ts":None,"mark_price":None,"mark_price_ts":None,"connection":"starting","stream_status":{"public":"starting","candles":"starting"},"candle_gaps":{timeframe:False for timeframe in CHART_TIMEFRAMES},"candle_gap_targets":{timeframe:None for timeframe in CHART_TIMEFRAMES},"stop":None,"task":None,"bootstrap_task":None,"resync_task":None,"reconcile_task":None,"news_task":None,"intraday_backfill_task":None,"risk_parameter_task":None,"backtest_tasks":set(),"news":_empty_news(),"news_source_status":[],"news_checked":False,"news_last_success":None,"plan_check_ts":0,"liquidation_refresh_ts":0,"market_analysis":None,"market_analysis_signature":None,"market_analysis_validation":None,"market_analysis_validation_key":None,"market_analysis_validation_at":0}
 subscribers:set[WebSocket]=set()
 pending_websockets=0
 news_aggregator=NewsAggregator()
 backtest_lock=asyncio.Lock()
 trade_plan_lock=threading.RLock()
+market_analysis_lock=threading.RLock()
+market_validation_lock=threading.Lock()
 backtest_executor:ProcessPoolExecutor|None=None
 
 
@@ -276,6 +285,89 @@ def technical_summary():
     return {"asOf":raw.get("as_of",0)+3600_000 if raw.get("as_of") else None,"status":"fresh" if technical_fresh else "unavailable","algorithmId":"aux-confluence-v2","technicalScore":raw.get("technical_score",0),"groups":groups,"vwap":flow.get("daily_vwap"),"weeklyVwap":flow.get("weekly_vwap"),"mfi":flow.get("mfi"),"volumeProfile":vp,"supportResistance":{"supports":[levels["donchian_support"]] if levels.get("donchian_support") is not None else [],"resistances":[levels["donchian_resistance"]] if levels.get("donchian_resistance") is not None else []},"momentum":f"RSI {momentum.get('rsi','—')} · Stoch RSI {momentum.get('stoch_rsi','—')} · Williams %R {momentum.get('williams_r','—')}","volatilityPhase":phase,"atrPercentile":vol.get("atr_percentile"),"bollingerWidthPercentile":vol.get("bollinger_width_percentile"),"volatility":vol,"positionScale":risk.get("position_scale"),"riskReasons":risk.get("reasons",[]),"riskOverlay":risk,"warnings":warnings}
 
 
+def _confirmed_candle_fingerprint(timeframe:str) -> tuple|None:
+    rows=db.candles(INSTRUMENT,timeframe,1,confirmed_only=True)
+    if not rows:return None
+    row=rows[-1]
+    return (row.timestamp,row.open,row.high,row.low,row.close,row.volume,row.volume_ccy)
+
+
+def _market_analysis_signature(now_ms:int|None=None) -> tuple:
+    current=int(time.time()*1000) if now_ms is None else int(now_ms)
+    fingerprints=[];lagging=[]
+    for timeframe in CHART_TIMEFRAMES:
+        fingerprint=_confirmed_candle_fingerprint(timeframe)
+        fingerprints.append(fingerprint)
+        interval=int(CANDLE_TIMEFRAMES[timeframe]["durationMs"])
+        expected_latest=(current//interval)*interval-interval
+        # A slightly early exchange-confirmed row is still ineligible until
+        # its real close boundary.  ``!=`` makes that future-to-eligible clock
+        # transition invalidate the cache as well as a genuinely missing row.
+        lagging.append(fingerprint is None or int(fingerprint[0])!=expected_latest)
+    gaps=tuple(bool(runtime.get("candle_gaps",{}).get(timeframe)) for timeframe in CHART_TIMEFRAMES)
+    return (*fingerprints,*lagging,str(runtime.get("connection") or "starting"),*gaps)
+
+
+def _market_validation_signature() -> tuple:
+    """Invalidate on every confirmed-corpus revision relevant to a decision.
+
+    One-minute candles after the latest completed 15m decision cannot change
+    an already reconstructed snapshot, so they are excluded until the next
+    15m close. Older 1m corrections/backfills and any 15m/1H/4H corpus change
+    do invalidate the report.
+    """
+    latest_fifteen=_confirmed_candle_fingerprint("15m")
+    one_minute_through=(int(latest_fifteen[0])+int(CANDLE_TIMEFRAMES["15m"]["durationMs"])-int(CANDLE_TIMEFRAMES["1m"]["durationMs"])) if latest_fifteen else -1
+    fingerprints=[db.candle_series_signature(INSTRUMENT,"1m",confirmed_only=True,through_ts=one_minute_through)]
+    for timeframe in ("15m","1H","4H"):
+        fingerprints.append(db.candle_series_signature(INSTRUMENT,timeframe,confirmed_only=True))
+    return tuple(fingerprints)
+
+
+def current_market_analysis(*,force:bool=False) -> dict:
+    """Build one deterministic v0.6 view from point-in-time closed candles."""
+    with market_analysis_lock:
+        signature=_market_analysis_signature()
+        cached=runtime.get("market_analysis")
+        if not force and cached is not None and signature==runtime.get("market_analysis_signature"):
+            return cached
+        decision_at=int(time.time()*1000)
+        candles={
+            timeframe:db.candles(INSTRUMENT,timeframe,MARKET_ANALYSIS_INPUT_LIMIT)
+            for timeframe in CHART_TIMEFRAMES
+        }
+        analysis=build_market_analysis(
+            candles,
+            decision_at=decision_at,
+            connection_status=str(runtime.get("connection") or "starting"),
+            gap_status={timeframe:bool(runtime.get("candle_gaps",{}).get(timeframe)) for timeframe in CHART_TIMEFRAMES},
+            include_series=True,
+        )
+        runtime["market_analysis"]=analysis
+        runtime["market_analysis_signature"]=signature
+        return analysis
+
+
+def _persist_market_analysis(analysis:dict,trigger:str) -> bool:
+    if not analysis.get("asOf") or analysis.get("compositeScore") is None:return False
+    compact=compact_analysis_snapshot(analysis)
+    compact["snapshotTrigger"]=trigger
+    return db.save_market_analysis_snapshot(compact,"LIVE_OBSERVED")
+
+
+async def publish_market_analysis(*,trigger:str,persist:bool=False,force:bool=True) -> dict:
+    previous=runtime.get("market_analysis")
+    analysis=current_market_analysis(force=force)
+    quality=str((analysis.get("dataQuality") or {}).get("status") or "UNAVAILABLE")
+    significant=bool(previous and analysis_changed_significantly(previous,analysis))
+    persisted=False
+    if (persist or significant) and quality not in {"UNAVAILABLE","STALE"}:
+        try:persisted=_persist_market_analysis(analysis,trigger)
+        except (TypeError,ValueError,ArithmeticError):pass
+    await broadcast({"type":"marketAnalysis","analysis":analysis,"trigger":trigger,"persisted":persisted})
+    return analysis
+
+
 async def broadcast(payload:dict):
     dead=[]
     for ws in list(subscribers):
@@ -469,6 +561,8 @@ async def on_okx(msg:dict):
     if msg.get("event")=="reconnecting":
         update_stream_status(stream_name,"reconnecting")
         await broadcast({"type":"market","price":runtime["price"],"tickerTime":runtime["ticker_ts"],"connectionStatus":runtime["connection"]})
+        try:await publish_market_analysis(trigger="CONNECTION_DEGRADED",persist=False)
+        except Exception:pass
         return
     if msg.get("event")=="message_error":
         return
@@ -478,6 +572,8 @@ async def on_okx(msg:dict):
         if stream_name in (None,"candles"):
             await resync_market_history()
             try:await publish_current_signal()
+            except Exception:pass
+            try:await publish_market_analysis(trigger="CONNECTION_RESTORED",persist=False)
             except Exception:pass
         return
     channel=msg.get("arg",{}).get("channel",""); data=msg.get("data",[]);valid=False;mark_updated=False
@@ -497,6 +593,9 @@ async def on_okx(msg:dict):
         published_rows=list(rows)
         previous=[row for row in db.candles(INSTRUMENT,tf,5) if row.confirm]
         received_confirmed=[row for row in rows if row.confirm]
+        newest_before=max((row.timestamp for row in previous),default=None)
+        newest_received=max((row.timestamp for row in received_confirmed),default=None)
+        confirmed_advanced=newest_received is not None and (newest_before is None or newest_received>newest_before)
         step=int(CANDLE_TIMEFRAMES[tf]["durationMs"])
         if previous and received_confirmed and min(row.timestamp for row in received_confirmed)>previous[-1].timestamp+step:
             _remember_candle_gap(tf,previous[-1].timestamp,min(row.timestamp for row in received_confirmed))
@@ -516,8 +615,10 @@ async def on_okx(msg:dict):
                 "candles":[row.model_dump(by_alias=True,mode="json") for row in published_rows],
                 "gapDetected":bool(runtime["candle_gaps"].get(tf)),
             })
-        if rows and rows[-1].confirm and tf in ANALYSIS_TIMEFRAMES:
-            await publish_current_signal()
+        if any(row.confirm for row in rows):
+            if tf in ANALYSIS_TIMEFRAMES:await publish_current_signal()
+            try:await publish_market_analysis(trigger=f"{tf}_CLOSE",persist=confirmed_advanced and tf in {"15m","1H","4H"})
+            except Exception:pass
         valid=bool(rows)
     elif channel=="funding-rate" and data:
         rows=client.parse_funding_rows(data,max_future_ms=48*3600_000);db.upsert_funding(INSTRUMENT,rows);valid=bool(rows)
@@ -596,7 +697,7 @@ async def backfill_intraday_history()->bool:
 
 async def reconcile_market_once()->bool:
     """Repair silent per-channel WS stalls using the public current-candle REST view."""
-    refreshed=False;analysis_refreshed=False
+    refreshed=False;analysis_refreshed=False;analysis_persist=False
     for tf in CHART_TIMEFRAMES:
         try:
             previous=[row for row in db.candles(INSTRUMENT,tf,5) if row.confirm]
@@ -608,6 +709,9 @@ async def reconcile_market_once()->bool:
                 rows=await client.candles(INSTRUMENT,tf,300,history=True)
             retention=CANDLE_TIMEFRAMES[tf].get("retentionMs")
             if rows:
+                newest_before=max((row.timestamp for row in previous),default=None)
+                newest_received=max((row.timestamp for row in received_confirmed),default=None)
+                confirmed_advanced=newest_received is not None and (newest_before is None or newest_received>newest_before)
                 db.upsert_candles(INSTRUMENT,rows,int(time.time()*1000)-int(retention) if retention else None)
                 gap_detected=_refresh_candle_gap_status(tf,rows);refreshed=True
                 await broadcast({
@@ -616,9 +720,13 @@ async def reconcile_market_once()->bool:
                     "gapDetected":gap_detected,
                 })
                 if tf in ANALYSIS_TIMEFRAMES:analysis_refreshed=True
+                if confirmed_advanced and tf in {"15m","1H","4H"}:analysis_persist=True
         except Exception:runtime["candle_gaps"][tf]=True
     if analysis_refreshed:
         try:await publish_current_signal()
+        except Exception:pass
+    if refreshed:
+        try:await publish_market_analysis(trigger="REST_RECONCILE",persist=analysis_persist)
         except Exception:pass
     return refreshed
 
@@ -811,10 +919,15 @@ def snapshot():
     for timeframe,rows in series.items():
         duration=int(CANDLE_TIMEFRAMES[timeframe]["durationMs"])
         last_at=rows[-1].timestamp if rows else None
+        last_confirmed=next((row for row in reversed(rows) if row.confirm),None)
+        last_confirmed_at=last_confirmed.timestamp if last_confirmed else None
+        confirmed_stale=not last_confirmed_at or now-(last_confirmed_at+duration)>2*duration
         candle_status[timeframe]={
             "available":bool(rows),
             "stale":not last_at or now-(last_at+duration)>2*duration,
             "lastAt":last_at,
+            "lastConfirmedAt":last_confirmed_at,
+            "confirmedStale":confirmed_stale,
             "gapDetected":bool(runtime.get("candle_gaps",{}).get(timeframe)),
         }
     return MarketSnapshot(
@@ -838,6 +951,47 @@ def advice_history(limit:int=Query(50,ge=1,le=500)):return {"items":db.signal_hi
 
 @app.get("/api/technical/summary")
 def technical_get():return technical_summary()
+
+
+@app.get("/api/market-analysis/current")
+def market_analysis_get():
+    return current_market_analysis()
+
+
+@app.get("/api/market-analysis/history")
+def market_analysis_history(limit:int=Query(100,ge=1,le=500)):
+    items=db.market_analysis_history(INSTRUMENT,MARKET_ANALYSIS_MODEL_VERSION,limit,"LIVE_OBSERVED")
+    return {"items":items,"retentionDays":180,"modelVersion":MARKET_ANALYSIS_MODEL_VERSION}
+
+
+@app.get("/api/market-analysis/validation")
+def market_analysis_validation():
+    now=int(time.time()*1000)
+    key=_market_validation_signature()
+    cached=runtime.get("market_analysis_validation")
+    cached_at=int(runtime.get("market_analysis_validation_at") or 0)
+    if cached is not None and key==runtime.get("market_analysis_validation_key") and now-cached_at<MARKET_ANALYSIS_VALIDATION_CACHE_MS:
+        return cached
+    # FastAPI executes this synchronous endpoint in a worker thread.  The
+    # report is CPU-heavy, so concurrent tabs share one reconstruction instead
+    # of starting duplicate 20+ second builds for the same public candles.
+    with market_validation_lock:
+        now=int(time.time()*1000)
+        key=_market_validation_signature()
+        cached=runtime.get("market_analysis_validation")
+        cached_at=int(runtime.get("market_analysis_validation_at") or 0)
+        if cached is not None and key==runtime.get("market_analysis_validation_key") and now-cached_at<MARKET_ANALYSIS_VALIDATION_CACHE_MS:
+            return cached
+        report=build_validation_report(
+            {timeframe:db.candles_since(INSTRUMENT,timeframe,0) for timeframe in CHART_TIMEFRAMES},
+            generated_at=now,
+            max_samples=MARKET_ANALYSIS_VALIDATION_WINDOW,
+            decision_stride=MARKET_ANALYSIS_VALIDATION_STRIDE,
+        )
+        runtime["market_analysis_validation"]=report
+        runtime["market_analysis_validation_key"]=key
+        runtime["market_analysis_validation_at"]=now
+        return report
 
 
 @app.get("/api/news")
@@ -1090,6 +1244,9 @@ async def clear_data():
     runtime["price"],runtime["ticker_ts"]=None,None
     runtime["mark_price"],runtime["mark_price_ts"]=None,None
     runtime["liquidation_refresh_ts"]=0
+    runtime["market_analysis"],runtime["market_analysis_signature"]=None,None
+    runtime["market_analysis_validation"],runtime["market_analysis_validation_key"]=None,None
+    runtime["market_analysis_validation_at"]=0
     runtime["candle_gaps"]={timeframe:False for timeframe in CHART_TIMEFRAMES}
     runtime["candle_gap_targets"]={timeframe:None for timeframe in CHART_TIMEFRAMES}
     runtime["news"],runtime["news_source_status"]=_empty_news("本地数据已清除，等待重新同步"),[]

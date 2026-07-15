@@ -119,6 +119,8 @@ class CandleSeriesStatus(APIModel):
     available: bool = False
     stale: bool = True
     last_at: int | None = None
+    last_confirmed_at: int | None = None
+    confirmed_stale: bool = True
     gap_detected: bool = False
 
 

@@ -68,6 +68,27 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\start.ps1 -SkipInstall
 
 冷启动时四周期近期数据与 1m/15m 保留窗口在后台分阶段回补，因此首次请求可能少于上述上限；页面随后继续接收实时增量，重新加载页面可读取已经写入 SQLite 的首屏窗口。当前没有面向图表的本地历史游标 API，向左平移不会继续请求更早 K 线。后续若实现，应新增有界的本地 `timeframe + before + limit` 分页接口和可见区触发加载，并在前端按时间戳合并且保持当前缩放/平移；不应扩大快照为全量历史响应。
 
+## v0.6 市场分析
+
+v0.6.0 新增独立、只读的多周期市场分析层，模型版本固定为 `indicator-regime-v06.0.0`。它只解释公共行情中已经收盘的 K 线，不读取账户、不改变工作台计划或真实执行状态，也不替换现有研究策略和冻结回测。
+
+- 单周期方向由七组贡献组成：已确认 swing 结构、EMA、MACD、RSI、DMI 方向、日 VWAP、OBV 与相对成交量，权重严格为 `30/20/15/10/10/5/10`。
+- 多周期权重严格为 `4H 0.40 / 1H 0.35 / 15m 0.20 / 1m 0.05`；1m 不能单独改变主要方向，4H 与 1H 相反时形成硬冲突并退回等待。
+- 趋势强度独立于方向分，六项权重为 `ADX 30% / EMA 斜率 20% / 结构持续性 20% / 突破持续性 10% / 成交量确认 10% / 波动支持 10%`。
+- Swing 只有在左右各 2 根均完成确认后可用；未来、未收盘、非法、冲突重复、缺口和过期数据都会降级，不以旧值、零值或未来值回填。
+- 关键位来自确认 swing、前日高低、日/周开盘、日/周 VWAP 和成交量分布 POC/VAH/VAL，经 `max(现价×0.05%, ATR14×0.35)` 聚类后最多显示 3 个支撑和 3 个阻力。
+- `NO_CHASE` 使用最近已收盘 15m 的 EMA20、ATR、日 VWAP、RSI、大 K 线和最近关键位给出具体原因，只改变操作上下文，不修改方向分。
+
+实时紧凑分析快照在 SQLite 中保留 180 天；15m/1H/4H 新确认收盘和综合判断显著变化可以保存快照，普通 current GET 与没有新确认 K 线的 REST 对账保持只读。同一时点和同一分析按语义内容幂等，不会因 WS/API 触发名称不同而重复保存。这不扩大原始 K 线保留，1m 仍只有 7 天、15m 仍只有 90 天。较早的历史重建缺少 1m 时会明确降级，绝不补未来数据。
+
+探索性验证使用 15m 决策网格、一次 60/40 时间切分、24 小时 purge 和 Newey-West/HAC 修正。交互报告对最近 960 个决策点每 4 根系统抽样一次：实际重建 240 点，训练描述区 121 点，锁定 OOS 96 点；OOS 的 1m/15m/1H/4H 特征覆盖为 68.75%/100%/100%/100%。15m、1h、4h、24h 方向命中率分别为 60.34%、44.83%、42.86%、24.44%；4h 和 24h HAC 有效样本不足，24h 方向化平均收益为 -1.3121%。当前只有一个锁定 OOS 区间，`validationPass=false`，禁止宣称模型已经通过验证。
+
+完整说明：
+
+- [市场分析模型](./docs/MARKET_ANALYSIS.md)
+- [指标定义](./docs/INDICATOR_DEFINITIONS.md)
+- [市场分析验证边界](./docs/MARKET_ANALYSIS_VALIDATION.md)
+
 ## 历史记录
 
 主导航的“历史记录”默认只显示 `live` 真实交易，Replay 记录必须手动切换且使用独立请求。列表可按方向、盈亏、止盈/止损和日期筛选，并展开查看四段实际成交、数量、杠杆、毛盈亏、手续费、滑点、净盈亏、账户收益率、终态和备注。
@@ -131,12 +152,15 @@ SQLite 不含交易所密钥，但会保存账户权益、个人计划、实际�
 powershell -NoProfile -ExecutionPolicy Bypass -File .\verify.ps1
 ```
 
-当前版本为 `0.5.0`。发布前使用 `verify.ps1` 运行 Python 编译、完整后端测试、前端测试、TypeScript 检查和 Vite 生产构建；实际结果记录在 [PROGRESS.md](./PROGRESS.md)。
+当前版本为 `0.6.0`。发布前使用 `verify.ps1` 运行 Python 编译、完整后端测试、前端测试、TypeScript 检查和 Vite 生产构建；实际结果记录在 [PROGRESS.md](./PROGRESS.md)。
 
 主要本地接口：
 
 - `GET /api/health`
 - `GET /api/market/snapshot`
+- `GET /api/market-analysis/current`
+- `GET /api/market-analysis/history`
+- `GET /api/market-analysis/validation`
 - `POST /api/workbench/calculate`
 - `GET /api/trade-plans/current`
 - `POST /api/trade-plans`

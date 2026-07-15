@@ -12,8 +12,13 @@ const apiMock = vi.hoisted(() => ({
 }))
 
 const chartProps = vi.hoisted(() => vi.fn())
+const marketAnalysisMock = vi.hoisted(() => ({ current: vi.fn() }))
 
 vi.mock('../src/workbench-api', () => ({ workbenchApi: apiMock }))
+vi.mock('../src/market-analysis-api', () => ({
+  marketAnalysisApi: marketAnalysisMock,
+  normalizeMarketAnalysis: (value: unknown) => value,
+}))
 vi.mock('../src/components/TradingPlanChart', () => ({
   default: (props: Record<string, unknown>) => {
     chartProps(props)
@@ -51,6 +56,18 @@ describe('WorkbenchView 真实交互', () => {
     apiMock.create.mockReset().mockResolvedValue(createdPlan)
     apiMock.update.mockReset().mockResolvedValue(createdPlan)
     apiMock.action.mockReset()
+    marketAnalysisMock.current.mockReset().mockResolvedValue({
+      overallBias: 'BEARISH', actionContext: 'NO_CHASE', compositeScore: -42, trendStrength: 54,
+      alignmentScore: 72, confidence: 66, summary: '大周期偏空，但等待 15m 反弹结束。', primaryReason: '4H 与 1H 同向偏空。',
+      invalidationLevel: 102_000, nearestSupport: 99_000, nearestResistance: 101_000,
+      timeframeAnalyses: [
+        { timeframe: '4H', status: 'AVAILABLE', bias: 'BEARISH', actionContext: '', regime: 'TREND', structure: 'LH_LL', volatilityState: 'NORMAL', score: -50, trendStrength: 60, confidence: 70, summary: '4H 偏空', primaryReason: '', asOf: 1_800_000_000_000, dataQuality: { status: 'AVAILABLE', fresh: true, stale: false, warnings: [], missingTimeframes: [], gapTimeframes: [] }, indicators: [], contributions: [] },
+        { timeframe: '1H', status: 'AVAILABLE', bias: 'BEARISH', actionContext: '', regime: 'TREND', structure: 'LH_LL', volatilityState: 'NORMAL', score: -40, trendStrength: 50, confidence: 65, summary: '1H 偏空', primaryReason: '', asOf: 1_800_000_000_000, dataQuality: { status: 'AVAILABLE', fresh: true, stale: false, warnings: [], missingTimeframes: [], gapTimeframes: [] }, indicators: [], contributions: [] },
+      ],
+      keyLevels: [], supportingReasons: [], conflictingReasons: [], riskWarnings: [],
+      dataQuality: { status: 'AVAILABLE', fresh: true, stale: false, warnings: [], missingTimeframes: [], gapTimeframes: [] },
+      asOf: 1_800_000_000_000, modelVersion: 'indicator-regime-v06.0.0', chartSeries: {},
+    })
     chartProps.mockClear()
   })
 
@@ -59,6 +76,7 @@ describe('WorkbenchView 真实交互', () => {
     const second = snapshot.candles1m[1]
     const corrected = { ...first, close: first.close + 10, confirm: true }
     expect(mergeRealtimeCandles([first, second], [corrected], 2)).toEqual([corrected, second])
+    expect(mergeRealtimeCandles([corrected, second], [{ ...corrected, close: 1, confirm: false }], 2)).toEqual([corrected, second])
     expect(mergeRealtimeCandles([first, second], [{ ...second, timestamp: second.timestamp + 60_000 }], 2).map(row => row.timestamp)).toEqual([second.timestamp, second.timestamp + 60_000])
   })
 
@@ -100,6 +118,19 @@ describe('WorkbenchView 真实交互', () => {
       takeProfitPrice: 99_000,
     })))
     expect(await screen.findByText('计划已创建，等待人工确认真实开仓')).toBeTruthy()
+  })
+
+  it('显示只读行情摘要并可打开完整页面，不修改计划或成交状态', async () => {
+    const open = vi.fn()
+    const user = userEvent.setup()
+    render(<WorkbenchView onOpenMarketAnalysis={open}/>)
+
+    expect((await screen.findByRole('region', { name: '市场分析摘要' })).textContent).toContain('大周期偏空，但等待 15m 反弹结束。')
+    await user.click(screen.getByRole('button', { name: '打开完整市场分析' }))
+    expect(open).toHaveBeenCalledTimes(1)
+    expect(apiMock.create).not.toHaveBeenCalled()
+    expect(apiMock.update).not.toHaveBeenCalled()
+    expect(apiMock.action).not.toHaveBeenCalled()
   })
 
   it('加载 v0.4 旧计划时用计划权益回填全仓支持余额基准，不静默套用 80U', async () => {

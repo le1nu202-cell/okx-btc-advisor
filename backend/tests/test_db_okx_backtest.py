@@ -443,3 +443,42 @@ def test_backtest_json_rejects_nonfinite_and_legacy_corruption_is_safe(tmp_path)
     response=_backtest_response(db.get_backtest("job"))
     assert response["result"] is None
     assert "损坏" in response["message"]
+
+
+def test_market_analysis_snapshots_are_immutable_idempotent_and_cleared(tmp_path):
+    db=Database(tmp_path/"market-analysis.db")
+    first={
+        "instrument":"BTC-USDT-SWAP","asOf":1_800_000_000_000,
+        "modelVersion":"indicator-regime-v06.0.0","overallBias":"SHORT_BIAS",
+        "actionContext":"WAIT","compositeScore":-42.0,
+        "dataQuality":{"status":"NORMAL"},"snapshotTrigger":"15m_CLOSE",
+    }
+    second={**first,"asOf":first["asOf"]+900_000,"compositeScore":-35.0}
+    assert db.save_market_analysis_snapshot(first) is True
+    assert db.save_market_analysis_snapshot(first) is False
+    assert db.save_market_analysis_snapshot({**first,"snapshotTrigger":"REST_RECONCILE"}) is False
+    assert db.save_market_analysis_snapshot(second) is True
+    history=db.market_analysis_history("BTC-USDT-SWAP","indicator-regime-v06.0.0",10)
+    assert [row["asOf"] for row in history]==[first["asOf"],second["asOf"]]
+    assert all(row["snapshotSource"]=="LIVE_OBSERVED" for row in history)
+    db.clear_local_data()
+    assert db.market_analysis_history("BTC-USDT-SWAP","indicator-regime-v06.0.0",10)==[]
+
+
+def test_market_analysis_snapshot_retention_uses_decision_time(tmp_path,monkeypatch):
+    import backend.db as db_module
+
+    db=Database(tmp_path/"market-analysis-retention.db")
+    now=1_800_000_000_000
+    retention=180*86400_000
+    clock=[now-retention-10_000]
+    monkeypatch.setattr(db_module.time,"time",lambda:clock[0]/1000)
+    base={
+        "instrument":"BTC-USDT-SWAP","modelVersion":"indicator-regime-v06.0.0",
+        "overallBias":"NEUTRAL","dataQuality":{"status":"NORMAL"},
+    }
+    assert db.save_market_analysis_snapshot({**base,"asOf":clock[0]}) is True
+    clock[0]=now
+    assert db.save_market_analysis_snapshot({**base,"asOf":now}) is True
+    history=db.market_analysis_history("BTC-USDT-SWAP","indicator-regime-v06.0.0",10)
+    assert [item["asOf"] for item in history]==[now]

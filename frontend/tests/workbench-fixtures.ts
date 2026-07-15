@@ -158,10 +158,10 @@ export const snapshot: MarketSnapshot = {
   candles1h,
   candles4h,
   candleStatus: {
-    '1m': { available: true, stale: false, lastAt: candles1m.at(-1)!.timestamp, gapDetected: false },
-    '15m': { available: true, stale: false, lastAt: candles15m.at(-1)!.timestamp, gapDetected: false },
-    '1H': { available: true, stale: false, lastAt: candles1h.at(-1)!.timestamp, gapDetected: false },
-    '4H': { available: true, stale: false, lastAt: candles4h.at(-1)!.timestamp, gapDetected: false },
+    '1m': { available: true, stale: false, lastAt: candles1m.at(-1)!.timestamp, lastConfirmedAt: candles1m.at(-1)!.timestamp, confirmedStale: false, gapDetected: false },
+    '15m': { available: true, stale: false, lastAt: candles15m.at(-1)!.timestamp, lastConfirmedAt: candles15m.at(-1)!.timestamp, confirmedStale: false, gapDetected: false },
+    '1H': { available: true, stale: false, lastAt: candles1h.at(-1)!.timestamp, lastConfirmedAt: candles1h.at(-1)!.timestamp, confirmedStale: false, gapDetected: false },
+    '4H': { available: true, stale: false, lastAt: candles4h.at(-1)!.timestamp, lastConfirmedAt: candles4h.at(-1)!.timestamp, confirmedStale: false, gapDetected: false },
   },
 }
 
