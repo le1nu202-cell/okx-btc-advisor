@@ -2,10 +2,43 @@ export type MarketRegime = 'TREND' | 'RANGE' | 'TRANSITION' | 'STALE'
 export type AdviceAction = 'LONG_CANDIDATE' | 'SHORT_CANDIDATE' | 'WATCH_LONG' | 'WATCH_SHORT' | 'WAIT'
 
 export interface Candle { timestamp: number; open: number; high: number; low: number; close: number; volume: number; confirm?: boolean }
+export type MarketTimeframe = '1m' | '15m' | '1H' | '4H'
+export interface CandleTimeframeStatus {
+  available: boolean
+  stale: boolean
+  lastAt: number | null
+  lastConfirmedAt?: number | null
+  confirmedStale?: boolean
+  gapDetected: boolean
+}
+
+const CANDLE_DURATION_MS: Record<MarketTimeframe, number> = {
+  '1m': 60_000,
+  '15m': 15 * 60_000,
+  '1H': 60 * 60_000,
+  '4H': 4 * 60 * 60_000,
+}
+
+/** Match the backend rule: a confirmed candle is stale after two further
+ * timeframe durations have elapsed beyond that candle's close. Explicit
+ * backend state wins; the timestamp fallback also covers local WS merges. */
+export const confirmedCandleIsStale = (
+  status: CandleTimeframeStatus | null | undefined,
+  timeframe: MarketTimeframe,
+  now = Date.now(),
+) => {
+  if (!status || status.available === false) return false
+  if (status.confirmedStale != null) return status.confirmedStale
+  if (status.lastConfirmedAt == null) return true
+  const duration = CANDLE_DURATION_MS[timeframe]
+  return now - (status.lastConfirmedAt + duration) > 2 * duration
+}
 export interface MarketSnapshot {
   instrument: string; price: number | null; updatedAt: number | null; stale: boolean; connectionStatus: string;
   fundingRate: number | null; fundingTime: number | null; openInterest: number | null; openInterestTime: number | null;
-  candles1h: Candle[]; candles4h: Candle[]
+  candles1m: Candle[]; candles15m: Candle[]; candles1h: Candle[]; candles4h: Candle[]
+  markPrice: number | null; markPriceTime: number | null
+  candleStatus: Record<MarketTimeframe, CandleTimeframeStatus>
 }
 export interface Contribution { name: string; score: number; value: number | null; explanation: string }
 export interface DataQuality { fresh: boolean; lastCandleAt: number | null; fundingAvailable: boolean; openInterestAvailable: boolean; warnings: string[] }

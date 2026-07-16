@@ -175,6 +175,16 @@ def test_invalid_future_4h_does_not_block_current_decision():
     assert dirty.action==clean.action and dirty.technical_score==clean.technical_score
 
 
+def test_invalid_future_1h_does_not_change_current_decision():
+    c1=candles(250,start=1_600_000_000_000+750*3600_000);c4=candles(250,"4H")
+    decision=c1[-1].timestamp+3600_000
+    clean=analyze(c1,c4,now_ms=decision)
+    future=c1[-1].model_copy(update={"timestamp":c1[-1].timestamp+3600_000,"high":1.0})
+    dirty=analyze([*c1,future],c4,now_ms=decision)
+    assert dirty.action==clean.action and dirty.technical_score==clean.technical_score
+    assert any("决策时点之后" in warning for warning in dirty.data_quality.warnings)
+
+
 def test_contributions_equal_published_technical_score():
     c1=candles(250,start=1_600_000_000_000+750*3600_000);c4=candles(250,"4H")
     a=analyze(c1,c4,now_ms=c1[-1].timestamp+3600_000)

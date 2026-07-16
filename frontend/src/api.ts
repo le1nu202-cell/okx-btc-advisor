@@ -1,4 +1,4 @@
-import type { AdviceAction, AdviceResponse, BacktestJob, BacktestParameters, BacktestResult, Candle, MarketRegime, MarketSnapshot, NewsResponse, RiskEstimate, Settings, SignalAdvice, TechnicalGroup, TechnicalSummary } from './types'
+import type { AdviceAction, AdviceResponse, BacktestJob, BacktestParameters, BacktestResult, Candle, CandleTimeframeStatus, MarketRegime, MarketSnapshot, MarketTimeframe, NewsResponse, RiskEstimate, Settings, SignalAdvice, TechnicalGroup, TechnicalSummary } from './types'
 import { normalizeBreakdown, normalizeSeries } from './backtest-utils.ts'
 import { confidencePercent } from './ui-contracts.ts'
 
@@ -22,11 +22,56 @@ const numbers = (v: unknown): number[] => Array.isArray(v) ? v.map(num).filter((
 const safeUrl = (v: unknown): string => { try { const u=new URL(String(v)); return ['http:','https:'].includes(u.protocol) ? u.toString() : '' } catch { return '' } }
 const wait = (ms:number,signal?:AbortSignal) => new Promise<void>((resolve,reject)=>{const timer=setTimeout(resolve,ms);signal?.addEventListener('abort',()=>{clearTimeout(timer);reject(new DOMException('已停止等待','AbortError'))},{once:true})})
 
+const MARKET_TIMEFRAMES: readonly MarketTimeframe[] = ['1m', '15m', '1H', '4H']
+
+function normalizeCandleStatus(value: unknown, candles: Record<MarketTimeframe, Candle[]>): Record<MarketTimeframe, CandleTimeframeStatus> {
+  const raw = value && typeof value === 'object' ? value as Record<string, unknown> : {}
+  return Object.fromEntries(MARKET_TIMEFRAMES.map(timeframe => {
+    const candidate = raw[timeframe]
+    const row = candidate && typeof candidate === 'object' ? candidate as Record<string, unknown> : {}
+    const latest = candles[timeframe].at(-1)?.timestamp ?? null
+    const latestConfirmed = [...candles[timeframe]].reverse().find(candle => candle.confirm === true)?.timestamp ?? null
+    const lastConfirmedAt = epoch(row.lastConfirmedAt) ?? latestConfirmed
+    return [timeframe, {
+      available: row.available == null ? candles[timeframe].length > 0 : Boolean(row.available),
+      stale: row.stale == null ? false : Boolean(row.stale),
+      lastAt: epoch(row.lastAt) ?? latest,
+      lastConfirmedAt,
+      confirmedStale: row.confirmedStale == null ? undefined : Boolean(row.confirmedStale),
+      gapDetected: Boolean(row.gapDetected),
+    }]
+  })) as Record<MarketTimeframe, CandleTimeframeStatus>
+}
+
 export const api = {
-  snapshot: async (): Promise<MarketSnapshot> => { const x = await get<Record<string, unknown>>('/api/market/snapshot'); return {
-    instrument: String(x.instrument ?? 'BTC-USDT-SWAP'), price: num(x.price), updatedAt: epoch(x.updatedAt), stale: Boolean(x.stale), connectionStatus: String(x.connectionStatus ?? 'unknown'),
-    fundingRate: num(x.fundingRate), fundingTime: epoch(x.fundingTime), openInterest: num(x.openInterest), openInterestTime: epoch(x.openInterestTime),
-    candles1h: ((x.candles1H ?? x.candles1h ?? []) as unknown[]).map(normalizeCandle).filter((row):row is Candle=>row!=null), candles4h: ((x.candles4H ?? x.candles4h ?? []) as unknown[]).map(normalizeCandle).filter((row):row is Candle=>row!=null) } },
+  snapshot: async (): Promise<MarketSnapshot> => {
+    const x = await get<Record<string, unknown>>('/api/market/snapshot')
+    const readCandles = (value: unknown) => (Array.isArray(value) ? value : []).map(normalizeCandle).filter((row): row is Candle => row != null)
+    const candles = {
+      '1m': readCandles(x.candles1M ?? x.candles1m),
+      '15m': readCandles(x.candles15M ?? x.candles15m),
+      '1H': readCandles(x.candles1H ?? x.candles1h),
+      '4H': readCandles(x.candles4H ?? x.candles4h),
+    } satisfies Record<MarketTimeframe, Candle[]>
+    return {
+      instrument: String(x.instrument ?? 'BTC-USDT-SWAP'),
+      price: num(x.price),
+      markPrice: num(x.markPrice),
+      markPriceTime: epoch(x.markPriceTime),
+      updatedAt: epoch(x.updatedAt),
+      stale: Boolean(x.stale),
+      connectionStatus: String(x.connectionStatus ?? 'unknown'),
+      fundingRate: num(x.fundingRate),
+      fundingTime: epoch(x.fundingTime),
+      openInterest: num(x.openInterest),
+      openInterestTime: epoch(x.openInterestTime),
+      candles1m: candles['1m'],
+      candles15m: candles['15m'],
+      candles1h: candles['1H'],
+      candles4h: candles['4H'],
+      candleStatus: normalizeCandleStatus(x.candleStatus, candles),
+    }
+  },
   advice: async (): Promise<AdviceResponse> => { const x = await get<Record<string, unknown>>('/api/advice/current'); return { advice: normalizeAdvice(x.advice ?? x), riskEstimate: normalizeRiskEstimate(x.riskEstimate) } },
   history: async (): Promise<SignalAdvice[]> => { const x = await get<unknown>('/api/advice/history'); const rows = Array.isArray(x) ? x : ((x as { items?: unknown[] }).items ?? []); return rows.map(normalizeAdvice) },
   technicalSummary: async (): Promise<TechnicalSummary> => normalizeTechnical(await get<unknown>('/api/technical/summary')),

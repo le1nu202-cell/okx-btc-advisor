@@ -67,11 +67,13 @@ def analyze(c1:list[Candle],c4:list[Candle],funding_rows:list[tuple[int,float]]|
     c1=[x for x in _clean_confirmed(c1) if x.timestamp+3600_000<=analysis_now];c4=_clean_confirmed(c4)
     signal_open=c1[-1].timestamp if c1 else 0
     decision_at=signal_open+3600_000 if signal_open else 0
-    invalid=any(x.confirm and not _valid_candle(x) for x in original_c1)
-    invalid=invalid or any(x.confirm and x.timestamp+4*3600_000<=decision_at and not _valid_candle(x) for x in original_c4)
+    # Validate only the point-in-time rows that are actually visible to this
+    # decision. A malformed future row must not be able to change an earlier
+    # historical result.
+    c4=[x for x in c4 if x.timestamp+4*3600_000<=decision_at]
+    invalid=any(not _valid_candle(x) for x in c1) or any(not _valid_candle(x) for x in c4)
     news_analysis=news_analysis or {"score":0,"status":"unavailable","items":[],"warnings":["消息面数据尚不可用"]}
     # A 1H decision may only see the 4H bar that has already closed.
-    c4=[x for x in c4 if x.confirm and x.timestamp+4*3600_000<=decision_at]
     gap_1h=_has_recent_gap(c1,3600_000,220)
     gap_4h=_has_recent_gap(c4,4*3600_000,200)
     funding_rows=[]

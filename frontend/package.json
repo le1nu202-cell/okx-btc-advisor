@@ -1,24 +1,32 @@
 {
   "name": "okx-btc-advisor-ui",
   "private": true,
-  "version": "0.3.0",
+  "version": "0.6.0",
   "type": "module",
   "scripts": {
     "dev": "vite --host 127.0.0.1",
     "build": "tsc -b && vite build",
-    "test": "node --experimental-strip-types --test tests/*.test.mjs",
+    "test": "pnpm run test:unit && pnpm run test:components",
+    "test:unit": "node --experimental-strip-types --test tests/*.test.mjs",
+    "test:components": "vitest run --config vitest.config.ts",
     "preview": "vite preview --host 127.0.0.1"
   },
   "dependencies": {
     "@vitejs/plugin-react": "6.0.3",
-    "vite": "8.1.4",
-    "typescript": "7.0.2",
+    "lightweight-charts": "5.2.0",
+    "lucide-react": "1.24.0",
     "react": "19.2.7",
     "react-dom": "19.2.7",
-    "lucide-react": "1.24.0"
+    "typescript": "7.0.2",
+    "vite": "8.1.4"
   },
   "devDependencies": {
+    "@testing-library/dom": "10.4.1",
+    "@testing-library/react": "16.3.2",
+    "@testing-library/user-event": "14.6.1",
     "@types/react": "19.2.17",
-    "@types/react-dom": "19.2.3"
+    "@types/react-dom": "19.2.3",
+    "jsdom": "29.1.1",
+    "vitest": "4.1.10"
   }
 }

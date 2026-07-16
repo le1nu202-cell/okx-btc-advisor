@@ -5,6 +5,7 @@ import ipaddress
 import json
 import math
 import os
+import threading
 import time
 import uuid
 from concurrent.futures import ProcessPoolExecutor
@@ -17,23 +18,61 @@ from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnec
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
+from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, Response
 from fastapi.staticfiles import StaticFiles
 
 from .backtest import run_backtest
 from .db import Database
-from .models import AdviceAction, BacktestRequest, BacktestStatus, MarketRegime, MarketSnapshot, Settings, SignalAdvice
+from .models import AdviceAction, BacktestRequest, BacktestStatus, Candle, MarketRegime, MarketSnapshot, Settings, SignalAdvice
 from .news import NewsAggregator, aggregate_news
-from .okx import OKXPublicClient
+from .liquidation import DEFAULT_MARK_PRICE_MAX_AGE_MS, actual_liquidation_estimate, planned_liquidation_scenarios
+from .market_analysis import MODEL_VERSION as MARKET_ANALYSIS_MODEL_VERSION
+from .market_analysis import analysis_changed_significantly, build_market_analysis, compact_analysis_snapshot
+from .market_validation import build_validation_report
+from .okx import ANALYSIS_TIMEFRAMES, CANDLE_TIMEFRAMES, CHANNEL_TO_TIMEFRAME, CHART_TIMEFRAMES, OKXPublicClient
 from .strategy import analyze, estimate_risk
 from .technical import analyze_technical
+from .trade_history import BulkDeleteTradeLogsRequest, encode_trade_log_csv, encode_trade_log_json
+from .workbench import (
+    TERMINAL_STATES,
+    ReplayCreateRequest,
+    ReplayPlanRequest,
+    RiskCalculation,
+    TradeActionRequest,
+    TradePlanDraft,
+    TradeState,
+    apply_action,
+    build_add_check,
+    build_trade_log,
+    calculate_risk,
+    candle_mark_to_market,
+    make_plan_record,
+    new_id,
+    normalize_live_execution_state,
+    now_ms,
+    price_trigger,
+    recompute_execution,
+    replay_candle_transition,
+    replay_start_index,
+    trade_statistics,
+    visible_replay_candles,
+)
 
 INSTRUMENT="BTC-USDT-SWAP"
 APP_ID="okx-btc-advisor"
-APP_VERSION="0.3.0"
+APP_VERSION="0.6.0"
 MAX_WEBSOCKET_CONNECTIONS=32
 NEWS_POLL_SECONDS=300
 NEWS_SOURCE_STALE_MS=15*60_000
+PUBLIC_RISK_CACHE_KEY="okx-public-risk:BTC-USDT-SWAP:cross"
+PUBLIC_RISK_REFRESH_MS=6*3600_000
+PUBLIC_RISK_MAX_STALE_MS=7*86400_000
+MARK_PRICE_STALE_MS=DEFAULT_MARK_PRICE_MAX_AGE_MS
+LIQUIDATION_REFRESH_MIN_INTERVAL_MS=1_000
+MARKET_ANALYSIS_INPUT_LIMIT=400
+MARKET_ANALYSIS_VALIDATION_CACHE_MS=15*60_000
+MARKET_ANALYSIS_VALIDATION_WINDOW=960
+MARKET_ANALYSIS_VALIDATION_STRIDE=4
 ROOT=Path(__file__).resolve().parents[1]
 db=Database(os.getenv("OKX_ADVISOR_DB",str(Path(__file__).with_name("data")/"advisor.db")))
 client=OKXPublicClient(base_url=os.getenv("OKX_BASE_URL","https://www.okx.com"),ws_url=os.getenv("OKX_WS_URL","wss://ws.okx.com:8443/ws/v5/public"),business_ws_url=os.getenv("OKX_BUSINESS_WS_URL","wss://ws.okx.com:8443/ws/v5/business"))
@@ -41,12 +80,53 @@ def _empty_news(message="新闻源正在连接"):
     return {"items":[],"analysis":{"asOf":None,"windowHours":48,"score":0,"articleCount":0,"status":"unavailable","sourceCoverage":0,"sourceStatus":[],"rawImpact":0,"coverageAdjustedImpact":0,"reason":"新闻数据不可用，严格按中性处理","warnings":[message]}}
 
 
-runtime={"price":None,"ticker_ts":None,"connection":"starting","stream_status":{"public":"starting","candles":"starting"},"stop":None,"task":None,"bootstrap_task":None,"resync_task":None,"reconcile_task":None,"news_task":None,"backtest_tasks":set(),"news":_empty_news(),"news_source_status":[],"news_checked":False,"news_last_success":None}
+runtime={"price":None,"ticker_ts":None,"mark_price":None,"mark_price_ts":None,"connection":"starting","stream_status":{"public":"starting","candles":"starting"},"candle_gaps":{timeframe:False for timeframe in CHART_TIMEFRAMES},"candle_gap_targets":{timeframe:None for timeframe in CHART_TIMEFRAMES},"stop":None,"task":None,"bootstrap_task":None,"resync_task":None,"reconcile_task":None,"news_task":None,"intraday_backfill_task":None,"risk_parameter_task":None,"backtest_tasks":set(),"news":_empty_news(),"news_source_status":[],"news_checked":False,"news_last_success":None,"plan_check_ts":0,"liquidation_refresh_ts":0,"market_analysis":None,"market_analysis_signature":None,"market_analysis_validation":None,"market_analysis_validation_key":None,"market_analysis_validation_at":0}
 subscribers:set[WebSocket]=set()
 pending_websockets=0
 news_aggregator=NewsAggregator()
 backtest_lock=asyncio.Lock()
+trade_plan_lock=threading.RLock()
+market_analysis_lock=threading.RLock()
+market_validation_lock=threading.Lock()
 backtest_executor:ProcessPoolExecutor|None=None
+
+
+def _public_risk_context(now:int|None=None) -> dict|None:
+    current=int(now or time.time()*1000)
+    try:cached=db.get_public_market_cache(PUBLIC_RISK_CACHE_KEY)
+    except (AttributeError,TypeError,ValueError):return None
+    if not cached:return None
+    updated=int(cached.get("updatedAt") or cached.get("observedAt") or 0)
+    age=current-updated
+    if updated<=0 or age< -60_000 or age>PUBLIC_RISK_MAX_STALE_MS:return None
+    if not isinstance(cached.get("tiers"),list) or not cached.get("contractValueBtc"):return None
+    return {**cached,"stale":age>PUBLIC_RISK_REFRESH_MS}
+
+
+def _risk_with_liquidation(plan:TradePlanDraft,risk:RiskCalculation|dict,*,evaluated_at:int|None=None) -> dict:
+    evaluation_time=int(evaluated_at if evaluated_at is not None else now_ms())
+    payload=risk.model_dump(by_alias=True,mode="json") if isinstance(risk,RiskCalculation) else dict(risk)
+    payload["liquidationScenarios"]=planned_liquidation_scenarios(
+        plan.model_dump(by_alias=True,mode="json"),payload,
+        mark_price=runtime.get("mark_price"),mark_price_time=runtime.get("mark_price_ts"),
+        public_context=_public_risk_context(evaluation_time),evaluated_at=evaluation_time,
+    )
+    return payload
+
+
+def _enrich_record_liquidation(record:dict,*,evaluated_at:int|None=None) -> dict:
+    evaluation_time=int(evaluated_at if evaluated_at is not None else now_ms())
+    updated=dict(record)
+    plan=TradePlanDraft.model_validate(updated["plan"])
+    risk=RiskCalculation.model_validate(updated["risk"])
+    updated["risk"]=_risk_with_liquidation(plan,risk,evaluated_at=evaluation_time)
+    execution_risk=dict(updated.get("executionRisk") or {})
+    execution_risk["liquidationEstimate"]=actual_liquidation_estimate(
+        updated,mark_price=runtime.get("mark_price"),mark_price_time=runtime.get("mark_price_ts"),
+        public_context=_public_risk_context(evaluation_time),evaluated_at=evaluation_time,
+    )
+    updated["executionRisk"]=execution_risk
+    return updated
 
 
 def _backtest_process_pool()->ProcessPoolExecutor:
@@ -205,12 +285,189 @@ def technical_summary():
     return {"asOf":raw.get("as_of",0)+3600_000 if raw.get("as_of") else None,"status":"fresh" if technical_fresh else "unavailable","algorithmId":"aux-confluence-v2","technicalScore":raw.get("technical_score",0),"groups":groups,"vwap":flow.get("daily_vwap"),"weeklyVwap":flow.get("weekly_vwap"),"mfi":flow.get("mfi"),"volumeProfile":vp,"supportResistance":{"supports":[levels["donchian_support"]] if levels.get("donchian_support") is not None else [],"resistances":[levels["donchian_resistance"]] if levels.get("donchian_resistance") is not None else []},"momentum":f"RSI {momentum.get('rsi','—')} · Stoch RSI {momentum.get('stoch_rsi','—')} · Williams %R {momentum.get('williams_r','—')}","volatilityPhase":phase,"atrPercentile":vol.get("atr_percentile"),"bollingerWidthPercentile":vol.get("bollinger_width_percentile"),"volatility":vol,"positionScale":risk.get("position_scale"),"riskReasons":risk.get("reasons",[]),"riskOverlay":risk,"warnings":warnings}
 
 
+def _confirmed_candle_fingerprint(timeframe:str) -> tuple|None:
+    rows=db.candles(INSTRUMENT,timeframe,1,confirmed_only=True)
+    if not rows:return None
+    row=rows[-1]
+    return (row.timestamp,row.open,row.high,row.low,row.close,row.volume,row.volume_ccy)
+
+
+def _market_analysis_signature(now_ms:int|None=None) -> tuple:
+    current=int(time.time()*1000) if now_ms is None else int(now_ms)
+    fingerprints=[];lagging=[]
+    for timeframe in CHART_TIMEFRAMES:
+        fingerprint=_confirmed_candle_fingerprint(timeframe)
+        fingerprints.append(fingerprint)
+        interval=int(CANDLE_TIMEFRAMES[timeframe]["durationMs"])
+        expected_latest=(current//interval)*interval-interval
+        # A slightly early exchange-confirmed row is still ineligible until
+        # its real close boundary.  ``!=`` makes that future-to-eligible clock
+        # transition invalidate the cache as well as a genuinely missing row.
+        lagging.append(fingerprint is None or int(fingerprint[0])!=expected_latest)
+    gaps=tuple(bool(runtime.get("candle_gaps",{}).get(timeframe)) for timeframe in CHART_TIMEFRAMES)
+    return (*fingerprints,*lagging,str(runtime.get("connection") or "starting"),*gaps)
+
+
+def _market_validation_signature() -> tuple:
+    """Invalidate on every confirmed-corpus revision relevant to a decision.
+
+    One-minute candles after the latest completed 15m decision cannot change
+    an already reconstructed snapshot, so they are excluded until the next
+    15m close. Older 1m corrections/backfills and any 15m/1H/4H corpus change
+    do invalidate the report.
+    """
+    latest_fifteen=_confirmed_candle_fingerprint("15m")
+    one_minute_through=(int(latest_fifteen[0])+int(CANDLE_TIMEFRAMES["15m"]["durationMs"])-int(CANDLE_TIMEFRAMES["1m"]["durationMs"])) if latest_fifteen else -1
+    fingerprints=[db.candle_series_signature(INSTRUMENT,"1m",confirmed_only=True,through_ts=one_minute_through)]
+    for timeframe in ("15m","1H","4H"):
+        fingerprints.append(db.candle_series_signature(INSTRUMENT,timeframe,confirmed_only=True))
+    return tuple(fingerprints)
+
+
+def current_market_analysis(*,force:bool=False) -> dict:
+    """Build one deterministic v0.6 view from point-in-time closed candles."""
+    with market_analysis_lock:
+        signature=_market_analysis_signature()
+        cached=runtime.get("market_analysis")
+        if not force and cached is not None and signature==runtime.get("market_analysis_signature"):
+            return cached
+        decision_at=int(time.time()*1000)
+        candles={
+            timeframe:db.candles(INSTRUMENT,timeframe,MARKET_ANALYSIS_INPUT_LIMIT)
+            for timeframe in CHART_TIMEFRAMES
+        }
+        analysis=build_market_analysis(
+            candles,
+            decision_at=decision_at,
+            connection_status=str(runtime.get("connection") or "starting"),
+            gap_status={timeframe:bool(runtime.get("candle_gaps",{}).get(timeframe)) for timeframe in CHART_TIMEFRAMES},
+            include_series=True,
+        )
+        runtime["market_analysis"]=analysis
+        runtime["market_analysis_signature"]=signature
+        return analysis
+
+
+def _persist_market_analysis(analysis:dict,trigger:str) -> bool:
+    if not analysis.get("asOf") or analysis.get("compositeScore") is None:return False
+    compact=compact_analysis_snapshot(analysis)
+    compact["snapshotTrigger"]=trigger
+    return db.save_market_analysis_snapshot(compact,"LIVE_OBSERVED")
+
+
+async def publish_market_analysis(*,trigger:str,persist:bool=False,force:bool=True) -> dict:
+    previous=runtime.get("market_analysis")
+    analysis=current_market_analysis(force=force)
+    quality=str((analysis.get("dataQuality") or {}).get("status") or "UNAVAILABLE")
+    significant=bool(previous and analysis_changed_significantly(previous,analysis))
+    persisted=False
+    if (persist or significant) and quality not in {"UNAVAILABLE","STALE"}:
+        try:persisted=_persist_market_analysis(analysis,trigger)
+        except (TypeError,ValueError,ArithmeticError):pass
+    await broadcast({"type":"marketAnalysis","analysis":analysis,"trigger":trigger,"persisted":persisted})
+    return analysis
+
+
 async def broadcast(payload:dict):
     dead=[]
     for ws in list(subscribers):
         try:await ws.send_json(payload)
         except Exception:dead.append(ws)
     for ws in dead:subscribers.discard(ws)
+
+
+def _save_terminal_trade_log(record:dict,source:str="live") -> dict|None:
+    state=TradeState(record["state"])
+    if state not in {TradeState.TAKE_PROFIT,TradeState.STOPPED}:return None
+    if record.get("logId"):
+        existing=[row for row in db.trade_logs(source,500) if row.get("id")==record["logId"]]
+        return existing[0] if existing else None
+    # A live plan has exactly one terminal log. A deterministic key protects
+    # the single-process application from duplicate writes even if a client
+    # retries the same confirmation while the first response is in flight.
+    record["logId"]=f"live:{record['id']}" if source=="live" else new_id()
+    if source=="replay":regime=str(record.get("regime4H") or "UNKNOWN")
+    else:
+        try:regime=current_advice().regime.value
+        except Exception:regime="UNKNOWN"
+    if source=="live":
+        enriched=_enrich_record_liquidation(record)
+    else:
+        enriched=recompute_execution(record)
+        replay_risk=dict(enriched.get("executionRisk") or {})
+        replay_risk["liquidationEstimate"]=actual_liquidation_estimate(
+            enriched,mark_price=None,mark_price_time=None,public_context=_public_risk_context(),
+        )
+        enriched["executionRisk"]=replay_risk
+    log=build_trade_log(enriched,source,regime)
+    # build_trade_log intentionally rebuilds the frozen execution accounting;
+    # restore the independent liquidation post-processing projection.
+    log["executionRisk"]=enriched["executionRisk"]
+    log["id"]=record["logId"]
+    db.save_trade_plan(record,active=True) if source=="live" else None
+    db.save_trade_log(log,source)
+    return log
+
+
+async def evaluate_active_plan_price(price:float|None) -> None:
+    if price is None:return
+    now=int(time.time()*1000)
+    if now-int(runtime.get("plan_check_ts") or 0)<1000:return
+    runtime["plan_check_ts"]=now
+    alert=None;plan_update=None
+    try:
+        with trade_plan_lock:
+            stored_record=db.get_active_trade_plan()
+            if not stored_record:return
+            record=normalize_live_execution_state(stored_record)
+            state=TradeState(record["state"])
+            if state in TERMINAL_STATES:return
+            fresh,_=_live_market_ready(now)
+            before_state=record["state"]
+            updated,event,message=price_trigger(record,float(price),fresh)
+            execution=recompute_execution(updated).get("execution",{})
+            if fresh and state not in {TradeState.PLANNED,TradeState.IDLE} and execution.get("mfeMaeSupported") and execution.get("openedQuantityBtc",0)>0:
+                mark=Candle(timestamp=now,open=float(price),high=float(price),low=float(price),close=float(price),volume=0,timeframe="live",confirm=False)
+                favorable,adverse=candle_mark_to_market(updated,mark)
+                updated["mfeUsdt"]=max(float(updated.get("mfeUsdt") or 0),favorable)
+                updated["maeUsdt"]=max(float(updated.get("maeUsdt") or 0),adverse)
+            updated=_enrich_record_liquidation(recompute_execution(updated),evaluated_at=now)
+            changed=record!=stored_record or updated!=record
+            if changed:db.save_trade_plan(updated,active=True)
+            if event:
+                db.save_trade_plan_event(updated["id"],before_state,updated["state"],event,float(price),{"message":message})
+                alert={"type":"tradePlanAlert","event":event,"message":message,"plan":updated,"log":None}
+            elif changed:
+                plan_update={"type":"tradePlanUpdate","reason":"TICKER_REFRESH","plan":updated}
+    except (TypeError,ValueError,ArithmeticError):
+        # A damaged local plan must never break public market ingestion.
+        return
+    if alert:await broadcast(alert)
+    elif plan_update:await broadcast(plan_update)
+
+
+async def refresh_active_plan_liquidation(*,reason:str="MARK_PRICE",evaluated_at:int|None=None,force:bool=False) -> dict|None:
+    """Persist and publish backend-authoritative mark-relative risk fields.
+
+    OKX mark-price can update several times per second.  The latest value is
+    always retained in runtime, while this derived plan projection is limited
+    to one save/broadcast per second.
+    """
+    evaluation_time=int(evaluated_at if evaluated_at is not None else now_ms())
+    last=int(runtime.get("liquidation_refresh_ts") or 0)
+    if not force and evaluation_time-last<LIQUIDATION_REFRESH_MIN_INTERVAL_MS:return None
+    runtime["liquidation_refresh_ts"]=evaluation_time
+    try:
+        with trade_plan_lock:
+            stored=db.get_active_trade_plan()
+            if not stored:return None
+            normalized=normalize_live_execution_state(stored)
+            updated=_enrich_record_liquidation(recompute_execution(normalized),evaluated_at=evaluation_time)
+            if updated!=stored:db.save_trade_plan(updated,active=True)
+    except (TypeError,ValueError,ArithmeticError):
+        return None
+    await broadcast({"type":"tradePlanUpdate","reason":reason,"plan":updated})
+    return updated
 
 
 async def publish_current_signal():
@@ -236,11 +493,76 @@ def update_stream_status(stream_name:str|None,status:str)->str:
     return overall
 
 
+def _remember_candle_gap(timeframe:str,start:int,end:int) -> None:
+    """Keep the exact missing interval until persisted confirmed rows cover it."""
+    if timeframe not in CANDLE_TIMEFRAMES or end<=start:return
+    targets=runtime.setdefault("candle_gap_targets",{tf:None for tf in CHART_TIMEFRAMES})
+    current=targets.get(timeframe)
+    if current:
+        start=min(int(start),int(current[0]));end=max(int(end),int(current[1]))
+    targets[timeframe]=(int(start),int(end))
+    runtime.setdefault("candle_gaps",{})[timeframe]=True
+
+
+def _internal_candle_gaps(rows:list[Candle],timeframe:str) -> list[tuple[int,int]]:
+    step=int(CANDLE_TIMEFRAMES[timeframe]["durationMs"])
+    timestamps=sorted({int(row.timestamp) for row in rows if row.confirm and row.timeframe==timeframe})
+    return [(left,right) for left,right in zip(timestamps,timestamps[1:]) if right-left!=step]
+
+
+def _refresh_candle_gap_status(timeframe:str,received:list[Candle]|None=None) -> bool:
+    """Validate merged, recently closed candles instead of trusting REST success.
+
+    A detected boundary is retained separately from the boolean UI status. A
+    later 300-row response therefore cannot hide a still-uncovered older
+    boundary merely by pushing its left endpoint out of the recent query.
+    """
+    received=list(received or [])
+    for start,end in _internal_candle_gaps(received,timeframe):
+        _remember_candle_gap(timeframe,start,end)
+
+    # Include one more row than the largest REST page so the merge boundary is
+    # visible when a response contains a full 300 rows.
+    persisted=db.candles(INSTRUMENT,timeframe,301)
+    merged={row.timestamp:row for row in persisted if row.confirm and row.timeframe==timeframe}
+    for row in received:
+        if row.confirm and row.timeframe==timeframe:merged[row.timestamp]=row
+    recent=[merged[timestamp] for timestamp in sorted(merged)]
+    for start,end in _internal_candle_gaps(recent,timeframe):
+        _remember_candle_gap(timeframe,start,end)
+
+    targets=runtime.setdefault("candle_gap_targets",{tf:None for tf in CHART_TIMEFRAMES})
+    target=targets.get(timeframe)
+    if target:
+        start,end=int(target[0]),int(target[1])
+        segment={row.timestamp:row for row in db.candles_since(INSTRUMENT,timeframe,start,confirmed_only=True) if row.timestamp<=end}
+        for row in received:
+            if row.confirm and row.timeframe==timeframe and start<=row.timestamp<=end:segment[row.timestamp]=row
+        ordered=[segment[timestamp] for timestamp in sorted(segment)]
+        covered=(
+            bool(ordered) and ordered[0].timestamp==start and ordered[-1].timestamp==end
+            and not _internal_candle_gaps(ordered,timeframe)
+        )
+        if not covered:
+            runtime["candle_gaps"][timeframe]=True
+            return True
+        targets[timeframe]=None
+
+    # One successful row is not evidence that a previously reported gap was
+    # repaired. Two or more contiguous closed rows can clear a target-less
+    # transient error; an empty/unclosed response leaves the prior status alone.
+    if len(recent)>=2 and any(row.confirm and row.timeframe==timeframe for row in received):
+        runtime["candle_gaps"][timeframe]=False
+    return bool(runtime["candle_gaps"].get(timeframe))
+
+
 async def on_okx(msg:dict):
     stream_name=msg.get("stream") or msg.get("_stream")
     if msg.get("event")=="reconnecting":
         update_stream_status(stream_name,"reconnecting")
         await broadcast({"type":"market","price":runtime["price"],"tickerTime":runtime["ticker_ts"],"connectionStatus":runtime["connection"]})
+        try:await publish_market_analysis(trigger="CONNECTION_DEGRADED",persist=False)
+        except Exception:pass
         return
     if msg.get("event")=="message_error":
         return
@@ -251,23 +573,52 @@ async def on_okx(msg:dict):
             await resync_market_history()
             try:await publish_current_signal()
             except Exception:pass
+            try:await publish_market_analysis(trigger="CONNECTION_RESTORED",persist=False)
+            except Exception:pass
         return
-    channel=msg.get("arg",{}).get("channel",""); data=msg.get("data",[]);valid=False
+    channel=msg.get("arg",{}).get("channel",""); data=msg.get("data",[]);valid=False;mark_updated=False
     if channel=="tickers" and data:
         parsed=client.parse_ticker(data[0])
         if parsed:
             valid=True
             if runtime["ticker_ts"] is None or parsed[1]>=runtime["ticker_ts"]:runtime["price"],runtime["ticker_ts"]=parsed
-    elif channel.startswith("candle"):
-        tf="1H" if channel=="candle1H" else "4H"; rows=client.parse_candles(data,tf)
-        previous=db.candles(INSTRUMENT,tf,1)
-        step=3600_000 if tf=="1H" else 4*3600_000
-        if previous and rows and min(row.timestamp for row in rows)>previous[-1].timestamp+step:
-            try:db.upsert_candles(INSTRUMENT,await client.candles(INSTRUMENT,tf,300,history=True))
+    elif channel=="mark-price" and data:
+        parsed=client.parse_mark_price(data[0])
+        if parsed:
+            valid=True
+            if runtime["mark_price_ts"] is None or parsed[1]>=runtime["mark_price_ts"]:
+                runtime["mark_price"],runtime["mark_price_ts"]=parsed;mark_updated=True
+    elif channel in CHANNEL_TO_TIMEFRAME:
+        tf=CHANNEL_TO_TIMEFRAME[channel]; rows=client.parse_candles(data,tf)
+        published_rows=list(rows)
+        previous=[row for row in db.candles(INSTRUMENT,tf,5) if row.confirm]
+        received_confirmed=[row for row in rows if row.confirm]
+        newest_before=max((row.timestamp for row in previous),default=None)
+        newest_received=max((row.timestamp for row in received_confirmed),default=None)
+        confirmed_advanced=newest_received is not None and (newest_before is None or newest_received>newest_before)
+        step=int(CANDLE_TIMEFRAMES[tf]["durationMs"])
+        if previous and received_confirmed and min(row.timestamp for row in received_confirmed)>previous[-1].timestamp+step:
+            _remember_candle_gap(tf,previous[-1].timestamp,min(row.timestamp for row in received_confirmed))
+            try:
+                repaired=await client.backfill_candles(INSTRUMENT,tf,previous[-1].timestamp)
+                retention=CANDLE_TIMEFRAMES[tf].get("retentionMs")
+                db.upsert_candles(INSTRUMENT,repaired,int(time.time()*1000)-int(retention) if retention else None)
+                published_rows=[*repaired,*rows]
             except Exception:pass
-        db.upsert_candles(INSTRUMENT,rows)
-        if rows and rows[-1].confirm:
-            await publish_current_signal()
+        retention=CANDLE_TIMEFRAMES[tf].get("retentionMs")
+        db.upsert_candles(INSTRUMENT,rows,int(time.time()*1000)-int(retention) if retention else None)
+        _refresh_candle_gap_status(tf,published_rows)
+        if published_rows:
+            await broadcast({
+                "type":"candle",
+                "timeframe":tf,
+                "candles":[row.model_dump(by_alias=True,mode="json") for row in published_rows],
+                "gapDetected":bool(runtime["candle_gaps"].get(tf)),
+            })
+        if any(row.confirm for row in rows):
+            if tf in ANALYSIS_TIMEFRAMES:await publish_current_signal()
+            try:await publish_market_analysis(trigger=f"{tf}_CLOSE",persist=confirmed_advanced and tf in {"15m","1H","4H"})
+            except Exception:pass
         valid=bool(rows)
     elif channel=="funding-rate" and data:
         rows=client.parse_funding_rows(data,max_future_ms=48*3600_000);db.upsert_funding(INSTRUMENT,rows);valid=bool(rows)
@@ -275,22 +626,44 @@ async def on_okx(msg:dict):
         parsed=client.parse_open_interest(data[0])
         if parsed:db.upsert_oi(INSTRUMENT,*parsed);valid=True
     if valid:update_stream_status(stream_name,"connected")
-    await broadcast({"type":"market","price":runtime["price"],"tickerTime":runtime["ticker_ts"],"connectionStatus":runtime["connection"]})
+    await broadcast({"type":"market","price":runtime["price"],"tickerTime":runtime["ticker_ts"],"markPrice":runtime["mark_price"],"markPriceTime":runtime["mark_price_ts"],"connectionStatus":runtime["connection"]})
+    if mark_updated:
+        await refresh_active_plan_liquidation(reason="MARK_PRICE")
+    if channel=="tickers" and valid:
+        await evaluate_active_plan_price(runtime["price"])
 
 
 async def resync_market_history()->bool:
     """Restore the complete live-analysis warm-up set without starting another WS."""
     errors=[]
-    for tf in ("1H","4H"):
+    for tf in CHART_TIMEFRAMES:
         try:
-            rows=await client.candles(INSTRUMENT,tf,300,history=True);db.upsert_candles(INSTRUMENT,rows)
-        except Exception as exc:errors.append(f"{tf}:{type(exc).__name__}")
+            rows=await client.candles(INSTRUMENT,tf,300,history=True)
+            retention=CANDLE_TIMEFRAMES[tf].get("retentionMs")
+            db.upsert_candles(INSTRUMENT,rows,int(time.time()*1000)-int(retention) if retention else None)
+            if not any(row.confirm for row in rows):runtime["candle_gaps"][tf]=True
+            gap_detected=_refresh_candle_gap_status(tf,rows)
+            if rows:
+                await broadcast({
+                    "type":"candle","timeframe":tf,
+                    "candles":[row.model_dump(by_alias=True,mode="json") for row in rows],
+                    "gapDetected":gap_detected,
+                })
+        except Exception as exc:
+            runtime["candle_gaps"][tf]=True
+            errors.append(f"{tf}:{type(exc).__name__}")
     try:db.upsert_funding(INSTRUMENT,await client.backfill_funding_history(INSTRUMENT,int(time.time()*1000)-91*86400_000))
     except Exception as exc:errors.append(f"funding:{type(exc).__name__}")
     try:
         oi=await client.open_interest(INSTRUMENT)
         if oi:db.upsert_oi(INSTRUMENT,*oi)
     except Exception as exc:errors.append(f"oi:{type(exc).__name__}")
+    try:
+        mark=await client.mark_price(INSTRUMENT)
+        if mark:
+            runtime["mark_price"],runtime["mark_price_ts"]=mark
+            await refresh_active_plan_liquidation(reason="MARK_PRICE_RESYNC",force=True)
+    except Exception as exc:errors.append(f"mark:{type(exc).__name__}")
     try:
         tick=await client.ticker(INSTRUMENT)
         if tick:runtime["price"],runtime["ticker_ts"]=tick
@@ -302,22 +675,58 @@ async def resync_market_history()->bool:
 async def bootstrap():
     await resync_market_history()
     runtime["stop"]=asyncio.Event(); runtime["task"]=asyncio.create_task(client.stream(on_okx,runtime["stop"]))
+    runtime["intraday_backfill_task"]=asyncio.create_task(backfill_intraday_history())
+
+
+async def backfill_intraday_history()->bool:
+    """Fill chart retention windows after WS startup so live data is not delayed."""
+    complete=True
+    now=int(time.time()*1000)
+    for tf in ("1m","15m"):
+        retention=int(CANDLE_TIMEFRAMES[tf]["retentionMs"])
+        cutoff=now-retention
+        try:
+            rows=await client.backfill_candles(INSTRUMENT,tf,cutoff)
+            db.upsert_candles(INSTRUMENT,rows,cutoff)
+            if not any(row.confirm for row in rows):runtime["candle_gaps"][tf]=True
+            if _refresh_candle_gap_status(tf,rows):complete=False
+        except Exception:
+            runtime["candle_gaps"][tf]=True;complete=False
+    return complete
 
 
 async def reconcile_market_once()->bool:
     """Repair silent per-channel WS stalls using the public current-candle REST view."""
-    refreshed=False
-    for tf in ("1H","4H"):
+    refreshed=False;analysis_refreshed=False;analysis_persist=False
+    for tf in CHART_TIMEFRAMES:
         try:
-            previous=db.candles(INSTRUMENT,tf,1)
+            previous=[row for row in db.candles(INSTRUMENT,tf,5) if row.confirm]
             rows=await client.candles(INSTRUMENT,tf,100,history=False)
-            step=3600_000 if tf=="1H" else 4*3600_000
-            if previous and rows and min(row.timestamp for row in rows)>previous[-1].timestamp+step:
+            received_confirmed=[row for row in rows if row.confirm]
+            step=int(CANDLE_TIMEFRAMES[tf]["durationMs"])
+            if previous and received_confirmed and min(row.timestamp for row in received_confirmed)>previous[-1].timestamp+step:
+                _remember_candle_gap(tf,previous[-1].timestamp,min(row.timestamp for row in received_confirmed))
                 rows=await client.candles(INSTRUMENT,tf,300,history=True)
-            if rows:db.upsert_candles(INSTRUMENT,rows);refreshed=True
+            retention=CANDLE_TIMEFRAMES[tf].get("retentionMs")
+            if rows:
+                newest_before=max((row.timestamp for row in previous),default=None)
+                newest_received=max((row.timestamp for row in received_confirmed),default=None)
+                confirmed_advanced=newest_received is not None and (newest_before is None or newest_received>newest_before)
+                db.upsert_candles(INSTRUMENT,rows,int(time.time()*1000)-int(retention) if retention else None)
+                gap_detected=_refresh_candle_gap_status(tf,rows);refreshed=True
+                await broadcast({
+                    "type":"candle","timeframe":tf,
+                    "candles":[row.model_dump(by_alias=True,mode="json") for row in rows],
+                    "gapDetected":gap_detected,
+                })
+                if tf in ANALYSIS_TIMEFRAMES:analysis_refreshed=True
+                if confirmed_advanced and tf in {"15m","1H","4H"}:analysis_persist=True
+        except Exception:runtime["candle_gaps"][tf]=True
+    if analysis_refreshed:
+        try:await publish_current_signal()
         except Exception:pass
     if refreshed:
-        try:await publish_current_signal()
+        try:await publish_market_analysis(trigger="REST_RECONCILE",persist=analysis_persist)
         except Exception:pass
     return refreshed
 
@@ -326,6 +735,27 @@ async def market_reconcile_loop():
     while True:
         await asyncio.sleep(300)
         await reconcile_market_once()
+
+
+async def refresh_public_risk_parameters()->bool:
+    """Atomically cache only validated public cross-margin contract data."""
+    try:
+        metadata,tiers=await asyncio.gather(
+            client.instrument_metadata(INSTRUMENT),
+            client.position_tiers("BTC-USDT","cross"),
+        )
+        updated=int(time.time()*1000)
+        db.put_public_market_cache(PUBLIC_RISK_CACHE_KEY,{**metadata,"tiers":tiers,"updatedAt":updated},updated)
+        return True
+    except Exception:
+        return False
+
+
+async def public_risk_parameter_loop():
+    while True:
+        if await refresh_public_risk_parameters():
+            await broadcast({"type":"riskParameters","updatedAt":now_ms()})
+        await asyncio.sleep(PUBLIC_RISK_REFRESH_MS/1000)
 
 
 async def news_loop():
@@ -357,30 +787,57 @@ async def lifespan(app:FastAPI):
     if os.getenv("OKX_DISABLE_NETWORK")!="1":
         runtime["bootstrap_task"]=asyncio.create_task(bootstrap())
         runtime["reconcile_task"]=asyncio.create_task(market_reconcile_loop())
+        runtime["risk_parameter_task"]=asyncio.create_task(public_risk_parameter_loop())
         runtime["news_task"]=asyncio.create_task(news_loop())
     yield
     if runtime["stop"]:runtime["stop"].set()
-    tasks=[x for x in (runtime["task"],runtime["bootstrap_task"],runtime["resync_task"],runtime["reconcile_task"],runtime["news_task"],*runtime["backtest_tasks"]) if x]
+    tasks=[x for x in (runtime["task"],runtime["bootstrap_task"],runtime["resync_task"],runtime["reconcile_task"],runtime["intraday_backfill_task"],runtime["risk_parameter_task"],runtime["news_task"],*runtime["backtest_tasks"]) if x]
     for task in tasks:task.cancel()
     if tasks:await asyncio.gather(*tasks,return_exceptions=True)
     if backtest_executor is not None:
         backtest_executor.shutdown(wait=False,cancel_futures=True);backtest_executor=None
 
 
-def _local_hostname(value:str|None)->bool:
+def _local_hostname(value:str|None,*,allow_testserver:bool=False)->bool:
     if not value:return False
-    try:host=(urlsplit(value if "://" in value else f"//{value}").hostname or "").lower()
+    try:
+        parsed=urlsplit(value if "://" in value else f"//{value}")
+        host=(parsed.hostname or "").lower()
+        parsed.port
     except ValueError:return False
-    if host in {"localhost","testserver"}:return True
+    if parsed.username is not None or parsed.password is not None:return False
+    if parsed.path not in ("","/") or parsed.query or parsed.fragment:return False
+    if host=="testserver":return allow_testserver
+    if host=="localhost":return True
     try:return ipaddress.ip_address(host).is_loopback
     except ValueError:return False
 
 
-def _local_origin(value:str|None)->bool:
+def _origin_allowed(value:str|None,request_host:str|None)->bool:
     if not value:return False
-    try:parsed=urlsplit(value)
+    try:
+        parsed=urlsplit(value)
+        host_parts=urlsplit(f"//{request_host or ''}")
+        origin_port=parsed.port or (443 if parsed.scheme=="https" else 80)
+        request_port=host_parts.port or (443 if parsed.scheme=="https" else 80)
     except ValueError:return False
-    return parsed.scheme in {"http","https"} and parsed.username is None and _local_hostname(value)
+    if (
+        parsed.scheme not in {"http","https"}
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.path not in ("","/")
+        or parsed.query
+        or parsed.fragment
+        or not _local_hostname(value)
+    ):return False
+    normalized=f"{parsed.scheme}://{(parsed.hostname or '').lower()}:{origin_port}"
+    if normalized in {"http://127.0.0.1:5173","http://localhost:5173"}:return True
+    return (
+        (parsed.hostname or "").lower()==(host_parts.hostname or "").lower()
+        and origin_port==request_port
+        and host_parts.username is None
+        and host_parts.password is None
+    )
 
 
 class LoopbackHostMiddleware:
@@ -390,7 +847,8 @@ class LoopbackHostMiddleware:
         if scope["type"] not in {"http","websocket"}:
             await self.app(scope,receive,send);return
         host=next((value.decode("latin-1") for key,value in scope.get("headers",[]) if key.lower()==b"host"),"")
-        if _local_hostname(host):
+        allow_testserver=os.getenv("OKX_TEST_MODE")=="1"
+        if _local_hostname(host,allow_testserver=allow_testserver):
             await self.app(scope,receive,send);return
         if scope["type"]=="websocket":
             await send({"type":"websocket.close","code":1008,"reason":"Invalid host"})
@@ -444,6 +902,7 @@ def health():return {"status":"ok","appId":APP_ID,"version":APP_VERSION,"instrum
 
 @app.get("/api/market/snapshot",response_model=MarketSnapshot,response_model_by_alias=True)
 def snapshot():
+    c1m=db.candles(INSTRUMENT,"1m",720);c15m=db.candles(INSTRUMENT,"15m",672)
     c1=db.candles(INSTRUMENT,"1H",200);c4=db.candles(INSTRUMENT,"4H",200);f=db.latest_funding(INSTRUMENT);oi=db.latest_oi(INSTRUMENT)
     now=int(time.time()*1000)
     latest_confirmed=next((candle for candle in reversed(c1) if candle.confirm),None)
@@ -455,7 +914,30 @@ def snapshot():
     # open interest already has its own explicit timestamp in the response.
     market_ts=max([x for x in (runtime["ticker_ts"],last_close) if x is not None],default=0)
     updated=time.strftime("%Y-%m-%dT%H:%M:%SZ",time.gmtime(market_ts/1000)) if market_ts else ""
-    return MarketSnapshot(instrument=INSTRUMENT,price=runtime["price"] or (c1[-1].close if c1 else None),updated_at=updated,stale=stale,candles_1h=c1,candles_4h=c4,funding_rate=f[1] if f else None,funding_time=f[0] if f else None,open_interest=oi[1] if oi else None,open_interest_time=oi[0] if oi else None,connection_status=runtime["connection"])
+    series={"1m":c1m,"15m":c15m,"1H":c1,"4H":c4}
+    candle_status={}
+    for timeframe,rows in series.items():
+        duration=int(CANDLE_TIMEFRAMES[timeframe]["durationMs"])
+        last_at=rows[-1].timestamp if rows else None
+        last_confirmed=next((row for row in reversed(rows) if row.confirm),None)
+        last_confirmed_at=last_confirmed.timestamp if last_confirmed else None
+        confirmed_stale=not last_confirmed_at or now-(last_confirmed_at+duration)>2*duration
+        candle_status[timeframe]={
+            "available":bool(rows),
+            "stale":not last_at or now-(last_at+duration)>2*duration,
+            "lastAt":last_at,
+            "lastConfirmedAt":last_confirmed_at,
+            "confirmedStale":confirmed_stale,
+            "gapDetected":bool(runtime.get("candle_gaps",{}).get(timeframe)),
+        }
+    return MarketSnapshot(
+        instrument=INSTRUMENT,price=runtime["price"] or (c1[-1].close if c1 else None),updated_at=updated,
+        stale=stale,candles_1m=c1m,candles_15m=c15m,candles_1h=c1,candles_4h=c4,
+        mark_price=runtime.get("mark_price"),mark_price_time=runtime.get("mark_price_ts"),candle_status=candle_status,
+        funding_rate=f[1] if f else None,funding_time=f[0] if f else None,
+        open_interest=oi[1] if oi else None,open_interest_time=oi[0] if oi else None,
+        connection_status=runtime["connection"],
+    )
 
 
 @app.get("/api/advice/current")
@@ -469,6 +951,47 @@ def advice_history(limit:int=Query(50,ge=1,le=500)):return {"items":db.signal_hi
 
 @app.get("/api/technical/summary")
 def technical_get():return technical_summary()
+
+
+@app.get("/api/market-analysis/current")
+def market_analysis_get():
+    return current_market_analysis()
+
+
+@app.get("/api/market-analysis/history")
+def market_analysis_history(limit:int=Query(100,ge=1,le=500)):
+    items=db.market_analysis_history(INSTRUMENT,MARKET_ANALYSIS_MODEL_VERSION,limit,"LIVE_OBSERVED")
+    return {"items":items,"retentionDays":180,"modelVersion":MARKET_ANALYSIS_MODEL_VERSION}
+
+
+@app.get("/api/market-analysis/validation")
+def market_analysis_validation():
+    now=int(time.time()*1000)
+    key=_market_validation_signature()
+    cached=runtime.get("market_analysis_validation")
+    cached_at=int(runtime.get("market_analysis_validation_at") or 0)
+    if cached is not None and key==runtime.get("market_analysis_validation_key") and now-cached_at<MARKET_ANALYSIS_VALIDATION_CACHE_MS:
+        return cached
+    # FastAPI executes this synchronous endpoint in a worker thread.  The
+    # report is CPU-heavy, so concurrent tabs share one reconstruction instead
+    # of starting duplicate 20+ second builds for the same public candles.
+    with market_validation_lock:
+        now=int(time.time()*1000)
+        key=_market_validation_signature()
+        cached=runtime.get("market_analysis_validation")
+        cached_at=int(runtime.get("market_analysis_validation_at") or 0)
+        if cached is not None and key==runtime.get("market_analysis_validation_key") and now-cached_at<MARKET_ANALYSIS_VALIDATION_CACHE_MS:
+            return cached
+        report=build_validation_report(
+            {timeframe:db.candles_since(INSTRUMENT,timeframe,0) for timeframe in CHART_TIMEFRAMES},
+            generated_at=now,
+            max_samples=MARKET_ANALYSIS_VALIDATION_WINDOW,
+            decision_stride=MARKET_ANALYSIS_VALIDATION_STRIDE,
+        )
+        runtime["market_analysis_validation"]=report
+        runtime["market_analysis_validation_key"]=key
+        runtime["market_analysis_validation_at"]=now
+        return report
 
 
 @app.get("/api/news")
@@ -486,12 +1009,246 @@ def settings_get():return db.get_settings()
 def settings_put(value:Settings):db.put_settings(value);return value
 
 
+@app.post("/api/workbench/calculate")
+def workbench_calculate(value:TradePlanDraft):
+    return _risk_with_liquidation(value,calculate_risk(value))
+
+
+@app.get("/api/trade-plans/current")
+def trade_plan_current():
+    with trade_plan_lock:
+        value=db.get_active_trade_plan()
+        if value:
+            value=normalize_live_execution_state(value)
+            value=recompute_execution(value)
+            value=_enrich_record_liquidation(value)
+            db.save_trade_plan(value,active=True)
+            return value
+    return {"id":None,"state":TradeState.IDLE.value,"plan":None,"risk":None,"events":[]}
+
+
+@app.post("/api/trade-plans",status_code=201)
+def trade_plan_create(value:TradePlanDraft):
+    with trade_plan_lock:
+        existing=db.get_active_trade_plan()
+        if existing and TradeState(existing["state"]) not in TERMINAL_STATES:
+            raise HTTPException(409,"已有未结束的交易计划，请先完成或取消")
+        try:record=_enrich_record_liquidation(make_plan_record(value))
+        except ValueError as exc:raise HTTPException(422,str(exc)) from exc
+        db.save_trade_plan(record,active=True)
+        db.save_trade_plan_event(record["id"],TradeState.IDLE.value,TradeState.PLANNED.value,"CREATE_PLAN",None,{"risk":record["risk"]})
+        return record
+
+
+@app.put("/api/trade-plans/{plan_id}")
+def trade_plan_update(plan_id:str,value:TradePlanDraft):
+    with trade_plan_lock:
+        record=db.get_trade_plan(plan_id)
+        if not record:raise HTTPException(404,"交易计划不存在")
+        if TradeState(record["state"])!=TradeState.PLANNED:
+            raise HTTPException(409,"只有尚未确认初始开仓的计划可以修改价格和仓位")
+        risk=calculate_risk(value)
+        if not risk.valid:raise HTTPException(422,"；".join(risk.errors))
+        updated={**record,"plan":value.model_dump(by_alias=True,mode="json"),"risk":_risk_with_liquidation(value,risk),"updatedAt":now_ms()}
+        updated.pop("activeReminder",None)
+        updated=_enrich_record_liquidation(recompute_execution(updated))
+        db.save_trade_plan(updated,active=True)
+        db.save_trade_plan_event(plan_id,record["state"],record["state"],"UPDATE_PLAN",None,{"risk":updated["risk"]})
+        return updated
+
+
+@app.post("/api/trade-plans/{plan_id}/actions")
+def trade_plan_action(plan_id:str,value:TradeActionRequest):
+    with trade_plan_lock:
+        record=db.get_trade_plan(plan_id)
+        if not record:raise HTTPException(404,"交易计划不存在")
+        record=normalize_live_execution_state(record)
+        before=record["state"]
+        try:updated,target=apply_action(record,value)
+        except ValueError as exc:raise HTTPException(409,str(exc)) from exc
+        updated=_enrich_record_liquidation(updated)
+        db.save_trade_plan(updated,active=True)
+        db.save_trade_plan_event(plan_id,before,target,value.action.value,value.price,{"note":value.note,"quantityBtc":value.quantity_btc})
+        log=_save_terminal_trade_log(updated,"live")
+        return {"plan":updated,"log":log}
+
+
+@app.get("/api/trade-plans/{plan_id}/events")
+def trade_plan_event_history(plan_id:str,limit:int=Query(200,ge=1,le=1000)):
+    if not db.get_trade_plan(plan_id):raise HTTPException(404,"交易计划不存在")
+    return {"items":db.trade_plan_events(plan_id,limit)}
+
+
+@app.get("/api/workbench/add-check")
+def workbench_add_check():
+    record=db.get_active_trade_plan()
+    if not record:raise HTTPException(404,"当前没有交易计划")
+    plan=TradePlanDraft.model_validate(record["plan"]);risk=RiskCalculation.model_validate(record["risk"])
+    c1=db.candles(INSTRUMENT,"1H",220,confirmed_only=True);c4=db.candles(INSTRUMENT,"4H",200,confirmed_only=True)
+    funding=db.latest_funding(INSTRUMENT);oi=db.open_interest_context(INSTRUMENT)
+    fresh,_=_live_market_ready()
+    try:regime=current_advice().regime
+    except Exception:regime=MarketRegime.STALE
+    try:technical=technical_summary()
+    except Exception:technical=None
+    return build_add_check(plan,risk,c1,c4,runtime["price"],funding[1] if funding else None,oi,technical,regime,fresh)
+
+
+@app.get("/api/trade-logs")
+def trade_log_history(source:str=Query("live",pattern="^(live|replay)$"),limit:int=Query(200,ge=1,le=1000)):
+    return {"items":db.trade_logs(source,limit)}
+
+
+@app.get("/api/trade-logs/statistics")
+def trade_log_statistics(source:str=Query("live",pattern="^(live|replay)$")):
+    return trade_statistics(db.trade_logs(source,None))
+
+
+@app.get("/api/trade-logs/export")
+def trade_log_export(
+    source:str=Query(...,pattern="^(live|replay)$"),
+    format:str=Query(...,pattern="^(csv|json)$"),
+):
+    rows=db.trade_logs(source,None);exported=now_ms()
+    if format=="csv":
+        content=encode_trade_log_csv(rows);media_type="text/csv; charset=utf-8";extension="csv"
+    else:
+        content=encode_trade_log_json(source,rows,exported);media_type="application/json";extension="json"
+    return Response(
+        content=content,media_type=media_type,
+        headers={"Content-Disposition":f'attachment; filename="trade-logs-{source}-{exported}.{extension}"'},
+    )
+
+
+@app.delete("/api/trade-logs/{log_id}")
+def trade_log_delete(log_id:str,source:str=Query(...,pattern="^(live|replay)$")):
+    if not log_id or len(log_id)>200:raise HTTPException(422,"invalid trade log id")
+    deleted=db.delete_trade_log(source,log_id)
+    return {"deleted":deleted,"deletedCount":1 if deleted else 0,"source":source,"id":log_id}
+
+
+@app.post("/api/trade-logs/bulk-delete")
+def trade_log_bulk_delete(value:BulkDeleteTradeLogsRequest):
+    deleted=db.bulk_delete_trade_logs(value.source,value.ids)
+    return {"deletedCount":len(deleted),"source":value.source}
+
+
+@app.delete("/api/trade-logs")
+def trade_log_clear(
+    source:str=Query(...,pattern="^(live|replay)$"),
+    confirmation:str=Query(...),
+):
+    if confirmation!="DELETE":raise HTTPException(422,"confirmation must equal DELETE")
+    return {"deletedCount":db.clear_trade_logs(source),"source":source}
+
+
+def _replay_data(record:dict)->dict:
+    one=db.candles_since(INSTRUMENT,"1H",0,confirmed_only=True)
+    four=db.candles_since(INSTRUMENT,"4H",0,confirmed_only=True)
+    index=next((i for i,candle in enumerate(one) if candle.timestamp==record["cursorTs"]),None)
+    if index is None:raise HTTPException(409,"Replay 所需历史 K 线已不存在")
+    visible_one,visible_four=visible_replay_candles(one,four,index)
+    public={**record,"candles1H":[row.model_dump(by_alias=True,mode="json") for row in visible_one],"candles4H":[row.model_dump(by_alias=True,mode="json") for row in visible_four]}
+    # The server keeps the next index private. No future candles, indicators or news are included.
+    public.pop("cursorIndex",None)
+    return public
+
+
+@app.post("/api/replay/sessions",status_code=201)
+def replay_create(value:ReplayCreateRequest):
+    one=db.candles_since(INSTRUMENT,"1H",0,confirmed_only=True)
+    four=db.candles_since(INSTRUMENT,"4H",0,confirmed_only=True)
+    try:index=replay_start_index(one,value.mode,value.start_at)
+    except ValueError as exc:raise HTTPException(422,str(exc)) from exc
+    now=now_ms();record={
+        "id":new_id(),"status":"SELECTED","state":TradeState.IDLE.value,
+        "mode":value.mode,"cursorTs":one[index].timestamp,"cursorIndex":index,
+        "plan":None,"risk":None,"addCount":0,"actualFills":{},"events":[],
+        "mfeUsdt":0.0,"maeUsdt":0.0,"regime4H":"UNKNOWN","createdAt":now,"updatedAt":now,"result":None,
+    }
+    db.save_replay_session(record)
+    return _replay_data(record)
+
+
+@app.put("/api/replay/sessions/{session_id}/plan")
+def replay_set_plan(session_id:str,value:ReplayPlanRequest):
+    record=db.get_replay_session(session_id)
+    if not record:raise HTTPException(404,"Replay 会话不存在")
+    risk=calculate_risk(value.plan)
+    if not risk.valid:raise HTTPException(422,"；".join(risk.errors))
+    updated={
+        **record,"status":"RUNNING","state":TradeState.INITIAL_OPEN.value,
+        "plan":value.plan.model_dump(by_alias=True,mode="json"),
+        "risk":risk.model_dump(by_alias=True,mode="json"),
+        "actualFills":{"initial":{"price":risk.initial_fill_price,"quantityBtc":risk.initial_quantity_btc}},"updatedAt":now_ms(),
+    }
+    updated=recompute_execution(updated)
+    db.save_replay_session(updated)
+    return _replay_data(updated)
+
+
+@app.post("/api/replay/sessions/{session_id}/actions")
+def replay_action(session_id:str,value:TradeActionRequest):
+    record=db.get_replay_session(session_id)
+    if not record:raise HTTPException(404,"Replay 会话不存在")
+    if not record.get("plan"):raise HTTPException(409,"请先在隐藏未来数据的图表上设置交易计划")
+    try:updated,_=apply_action(record,value)
+    except ValueError as exc:raise HTTPException(409,str(exc)) from exc
+    if TradeState(updated["state"]) in TERMINAL_STATES:updated["status"]="COMPLETE"
+    updated["events"]=[*list(updated.get("events") or []),{"type":value.action.value,"price":value.price,"at":updated["cursorTs"]}]
+    log=_save_terminal_trade_log(updated,"replay")
+    if log:updated["result"]=log
+    db.save_replay_session(updated)
+    return _replay_data(updated)
+
+
+@app.post("/api/replay/sessions/{session_id}/step")
+def replay_step(session_id:str,count:int=Query(1,ge=1,le=24)):
+    record=db.get_replay_session(session_id)
+    if not record:raise HTTPException(404,"Replay 会话不存在")
+    if record.get("status")!="RUNNING" or not record.get("plan"):
+        raise HTTPException(409,"Replay 尚未设置计划或已经结束")
+    one=db.candles_since(INSTRUMENT,"1H",0,confirmed_only=True)
+    index=next((i for i,candle in enumerate(one) if candle.timestamp==record["cursorTs"]),None)
+    if index is None:raise HTTPException(409,"Replay 所需历史 K 线已不存在")
+    updated=record
+    for _ in range(count):
+        index+=1
+        if index>=len(one):
+            updated["status"]="COMPLETE";break
+        updated={**updated,"cursorTs":one[index].timestamp,"cursorIndex":index,"updatedAt":now_ms()}
+        updated,event=replay_candle_transition(updated,one[index])
+        if event:
+            updated["events"]=[*list(updated.get("events") or []),{"type":event,"price":None,"at":one[index].timestamp}]
+        if TradeState(updated["state"]) in TERMINAL_STATES:
+            updated["status"]="COMPLETE"
+            log=_save_terminal_trade_log(updated,"replay")
+            if log:updated["result"]=log
+            break
+    db.save_replay_session(updated)
+    return _replay_data(updated)
+
+
+@app.get("/api/replay/sessions/{session_id}")
+def replay_get(session_id:str):
+    record=db.get_replay_session(session_id)
+    if not record:raise HTTPException(404,"Replay 会话不存在")
+    return _replay_data(record)
+
+
 @app.delete("/api/local-data")
 async def clear_data():
     if backtest_lock.locked():
         raise HTTPException(409,"回测运行期间不能清除本地数据")
     db.clear_local_data()
     runtime["price"],runtime["ticker_ts"]=None,None
+    runtime["mark_price"],runtime["mark_price_ts"]=None,None
+    runtime["liquidation_refresh_ts"]=0
+    runtime["market_analysis"],runtime["market_analysis_signature"]=None,None
+    runtime["market_analysis_validation"],runtime["market_analysis_validation_key"]=None,None
+    runtime["market_analysis_validation_at"]=0
+    runtime["candle_gaps"]={timeframe:False for timeframe in CHART_TIMEFRAMES}
+    runtime["candle_gap_targets"]={timeframe:None for timeframe in CHART_TIMEFRAMES}
     runtime["news"],runtime["news_source_status"]=_empty_news("本地数据已清除，等待重新同步"),[]
     runtime["news_checked"],runtime["news_last_success"]=False,None
     resyncing=False
@@ -609,7 +1366,7 @@ def backtest_delete(id:str):
 async def live(ws:WebSocket):
     global pending_websockets
     origin=ws.headers.get("origin")
-    if origin is not None and not _local_origin(origin):
+    if origin is not None and not _origin_allowed(origin,ws.headers.get("host")):
         await ws.close(code=1008,reason="Origin is not allowed");return
     if len(subscribers)+pending_websockets>=MAX_WEBSOCKET_CONNECTIONS:
         await ws.close(code=1013,reason="Too many local connections");return

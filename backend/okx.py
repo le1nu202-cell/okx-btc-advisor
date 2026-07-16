@@ -16,10 +16,25 @@ import websockets
 from .models import Candle
 
 
+CANDLE_TIMEFRAMES = {
+    "1m": {"channel": "candle1m", "durationMs": 60_000, "retentionMs": 7 * 86_400_000},
+    "15m": {"channel": "candle15m", "durationMs": 15 * 60_000, "retentionMs": 90 * 86_400_000},
+    "1H": {"channel": "candle1H", "durationMs": 3_600_000, "retentionMs": None},
+    "4H": {"channel": "candle4H", "durationMs": 4 * 3_600_000, "retentionMs": None},
+}
+TIMEFRAME_SPECS = CANDLE_TIMEFRAMES
+CHART_TIMEFRAMES = tuple(TIMEFRAME_SPECS)
+ANALYSIS_TIMEFRAMES = frozenset({"1H", "4H"})
+CHANNEL_TO_TIMEFRAME = {str(spec["channel"]): timeframe for timeframe, spec in TIMEFRAME_SPECS.items()}
+
+
 class OKXError(RuntimeError): pass
 
 
 class OKXPublicClient:
+    REST_ORIGIN = "https://www.okx.com"
+    PUBLIC_WS_URL = "wss://ws.okx.com:8443/ws/v5/public"
+    BUSINESS_WS_URL = "wss://ws.okx.com:8443/ws/v5/business"
     MIN_MARKET_TS = 1_230_768_000_000
     BULK_DOWNLOAD_HOSTS = {"static.okx.com"}
     MAX_BULK_URLS = 64
@@ -27,13 +42,57 @@ class OKXPublicClient:
     MAX_ZIP_ENTRIES = 32
     MAX_UNCOMPRESSED_BYTES = 100 * 1024 * 1024
     MAX_COMPRESSION_RATIO = 200
+    PUBLIC_REST_PATHS = frozenset({
+        "/api/v5/market/history-candles",
+        "/api/v5/market/candles",
+        "/api/v5/market/ticker",
+        "/api/v5/public/funding-rate-history",
+        "/api/v5/public/open-interest",
+        "/api/v5/public/market-data-history",
+        "/api/v5/public/instruments",
+        "/api/v5/public/position-tiers",
+        "/api/v5/public/mark-price",
+    })
 
     def __init__(self, base_url="https://www.okx.com", ws_url="wss://ws.okx.com:8443/ws/v5/public", business_ws_url="wss://ws.okx.com:8443/ws/v5/business", timeout=20):
-        self.base_url=base_url.rstrip("/"); self.ws_url=ws_url; self.business_ws_url=business_ws_url; self.timeout=timeout
+        self.base_url=self._validated_rest_url(base_url)
+        self.ws_url=self._validated_ws_url(ws_url,"/ws/v5/public")
+        self.business_ws_url=self._validated_ws_url(business_ws_url,"/ws/v5/business")
+        self.timeout=timeout
+
+    @classmethod
+    def _validated_rest_url(cls,value:str)->str:
+        try:parts=urlsplit(str(value))
+        except (TypeError,ValueError) as exc:raise ValueError("OKX REST 地址必须是官方公共主机 https://www.okx.com") from exc
+        try:port=parts.port
+        except ValueError as exc:raise ValueError("OKX REST 地址端口无效") from exc
+        valid=(
+            parts.scheme.lower()=="https" and (parts.hostname or "").lower()=="www.okx.com"
+            and port is None and parts.path in ("","/") and not parts.query and not parts.fragment
+            and parts.username is None and parts.password is None
+        )
+        if not valid:raise ValueError("OKX REST 地址必须是官方公共主机 https://www.okx.com")
+        return cls.REST_ORIGIN
+
+    @classmethod
+    def _validated_ws_url(cls,value:str,expected_path:str)->str:
+        try:parts=urlsplit(str(value))
+        except (TypeError,ValueError) as exc:raise ValueError("OKX WebSocket 地址必须是官方免鉴权行情端点") from exc
+        try:port=parts.port
+        except ValueError as exc:raise ValueError("OKX WebSocket 地址端口无效") from exc
+        valid=(
+            parts.scheme.lower()=="wss" and (parts.hostname or "").lower()=="ws.okx.com"
+            and port==8443 and parts.path==expected_path and not parts.query and not parts.fragment
+            and parts.username is None and parts.password is None
+        )
+        if not valid:raise ValueError("OKX WebSocket 地址必须是官方免鉴权行情端点")
+        return f"wss://ws.okx.com:8443{expected_path}"
 
     async def _get(self,path,params=None):
+        if path not in self.PUBLIC_REST_PATHS:
+            raise OKXError("REST path is not in the public read-only allowlist")
         last=None
-        async with httpx.AsyncClient(base_url=self.base_url,timeout=self.timeout,follow_redirects=True) as client:
+        async with httpx.AsyncClient(base_url=self.base_url,timeout=self.timeout,follow_redirects=False) as client:
             for attempt in range(3):
                 try:
                     r=await client.get(path,params=params); r.raise_for_status(); body=r.json()
@@ -46,11 +105,11 @@ class OKXPublicClient:
 
     @classmethod
     def parse_candles(cls,rows,timeframe,now_ms=None):
-        if timeframe not in {"1H","4H"}:
+        if timeframe not in TIMEFRAME_SPECS:
             raise ValueError(f"unsupported candle timeframe: {timeframe}")
         found={}
         now_ms=int(time.time()*1000) if now_ms is None else int(now_ms)
-        duration_ms=3600_000 if timeframe=="1H" else 4*3600_000
+        duration_ms=int(TIMEFRAME_SPECS[timeframe]["durationMs"])
         for r in rows:
             if len(r)<9:continue
             try:
@@ -118,6 +177,56 @@ class OKXPublicClient:
         if not cls.MIN_MARKET_TS<=ts<=now_ms+60_000 or not math.isfinite(value) or value<0:return None
         return ts,value
 
+    @classmethod
+    def parse_mark_price(cls,row,now_ms=None):
+        now_ms=int(time.time()*1000) if now_ms is None else int(now_ms)
+        try:price=float(row["markPx"]);ts=int(row["ts"])
+        except (KeyError,TypeError,ValueError,OverflowError):return None
+        if not math.isfinite(price) or price<=0 or not cls.MIN_MARKET_TS<=ts<=now_ms+60_000:return None
+        return price,ts
+
+    @classmethod
+    def parse_instrument_metadata(cls,row,instrument="BTC-USDT-SWAP"):
+        try:
+            if str(row["instId"])!=instrument or str(row["instType"])!="SWAP":raise ValueError("unexpected instrument")
+            contract_value=float(row["ctVal"]);lot_size=float(row["lotSz"]);tick_size=float(row["tickSz"])
+            family=str(row.get("instFamily") or "")
+        except (KeyError,TypeError,ValueError,OverflowError) as exc:
+            raise OKXError("invalid public instrument metadata") from exc
+        if (
+            not all(math.isfinite(value) and value>0 for value in (contract_value,lot_size,tick_size))
+            or str(row.get("ctType") or "").lower()!="linear"
+            or str(row.get("ctValCcy") or "").upper()!="BTC"
+            or family!="BTC-USDT"
+        ):
+            raise OKXError("unsupported public contract metadata")
+        return {
+            "instrument":instrument,"instrumentFamily":family,"contractValueBtc":contract_value,
+            "lotSizeContracts":lot_size,"tickSize":tick_size,
+        }
+
+    @classmethod
+    def parse_position_tiers(cls,rows,inst_family="BTC-USDT"):
+        found={}
+        for row in rows:
+            try:
+                if str(row.get("instFamily") or "")!=inst_family:raise ValueError("unexpected family")
+                tier=int(row["tier"]);minimum=float(row["minSz"]);maximum=float(row["maxSz"])
+                mmr=float(row["mmr"]);imr=float(row["imr"]);max_leverage=float(row["maxLever"])
+            except (KeyError,TypeError,ValueError,OverflowError) as exc:
+                raise OKXError("invalid public position tier") from exc
+            if (
+                tier<=0 or tier in found or not all(math.isfinite(value) for value in (minimum,maximum,mmr,imr,max_leverage))
+                or minimum<0 or maximum<=minimum or not 0<=mmr<1 or not 0<imr<=1 or imr<mmr or max_leverage<=0
+            ):
+                raise OKXError("invalid public position tier")
+            found[tier]={
+                "tier":tier,"minContracts":minimum,"maxContracts":maximum,
+                "maintenanceMarginRate":mmr,"initialMarginRate":imr,"maxLeverage":max_leverage,
+            }
+        if not found:raise OKXError("empty public position tiers")
+        return [found[tier] for tier in sorted(found)]
+
     async def candles(self,instrument="BTC-USDT-SWAP",bar="1H",limit=300,after=None,before=None,history=True):
         p={"instId":instrument,"bar":bar,"limit":min(300,limit)}
         if after is not None:p["after"]=str(after)
@@ -165,6 +274,22 @@ class OKXPublicClient:
         d=await self._get("/api/v5/public/open-interest",{"instType":"SWAP","instId":instrument})
         return self.parse_open_interest(d[0]) if d else None
 
+    async def mark_price(self,instrument="BTC-USDT-SWAP"):
+        data=await self._get("/api/v5/public/mark-price",{"instType":"SWAP","instId":instrument})
+        return self.parse_mark_price(data[0]) if data else None
+
+    async def instrument_metadata(self,instrument="BTC-USDT-SWAP"):
+        data=await self._get("/api/v5/public/instruments",{"instType":"SWAP","instId":instrument})
+        if not data:raise OKXError("public instrument metadata unavailable")
+        return self.parse_instrument_metadata(data[0],instrument)
+
+    async def position_tiers(self,inst_family="BTC-USDT",td_mode="cross"):
+        if td_mode!="cross":raise ValueError("public risk tiers are fixed to cross margin mode")
+        data=await self._get("/api/v5/public/position-tiers",{
+            "instType":"SWAP","tdMode":td_mode,"instFamily":inst_family,
+        })
+        return self.parse_position_tiers(data,inst_family)
+
     async def bulk_funding_history(self,begin_ms:int,end_ms:int,inst_family="BTC-USDT") -> list[tuple[int,float]]:
         """Download official monthly public-data ZIPs. Missing months remain missing."""
         params={"module":"3","instType":"SWAP","instFamilyList":inst_family,"dateAggrType":"monthly","begin":str(begin_ms),"end":str(end_ms)}
@@ -180,16 +305,33 @@ class OKXPublicClient:
         if len(urls)>self.MAX_BULK_URLS:
             raise OKXError("too many bulk funding files")
         out={}
-        async with httpx.AsyncClient(timeout=60,follow_redirects=True) as client:
+        # Reject redirects rather than validating only the final URL: every
+        # outbound hop must remain inside the explicit official-host policy.
+        async with httpx.AsyncClient(timeout=60,follow_redirects=False) as client:
             for url in urls:
                 parts=urlsplit(url)
-                if parts.scheme!="https" or (parts.hostname or "").lower() not in self.BULK_DOWNLOAD_HOSTS:
+                try:port=parts.port
+                except ValueError as exc:raise OKXError("untrusted bulk funding download URL") from exc
+                if (
+                    parts.scheme!="https"
+                    or (parts.hostname or "").lower() not in self.BULK_DOWNLOAD_HOSTS
+                    or port not in (None,443)
+                    or parts.username is not None
+                    or parts.password is not None
+                ):
                     raise OKXError("untrusted bulk funding download URL")
                 raw=bytearray()
                 async with client.stream("GET",url) as response:
+                    if response.is_redirect:
+                        raise OKXError("bulk funding redirects are not allowed")
                     response.raise_for_status()
                     final=response.url
-                    if final.scheme!="https" or (final.host or "").lower() not in self.BULK_DOWNLOAD_HOSTS:
+                    if (
+                        final.scheme!="https"
+                        or (final.host or "").lower() not in self.BULK_DOWNLOAD_HOSTS
+                        or getattr(final,"port",None) not in (None,443)
+                        or bool(getattr(final,"userinfo",None))
+                    ):
                         raise OKXError("bulk funding redirect left the trusted host")
                     length=response.headers.get("content-length")
                     if length and int(length)>self.MAX_DOWNLOAD_BYTES:
@@ -224,7 +366,17 @@ class OKXPublicClient:
         delay=1
         while not stop.is_set():
             try:
-                async with websockets.connect(url,ping_interval=20,ping_timeout=15) as ws:
+                connector=websockets.connect(
+                    url,ping_interval=20,ping_timeout=15,
+                    host="ws.okx.com",port=8443,
+                )
+                # websockets follows redirects by default. Disable every
+                # redirect (including same-origin path changes) so an OKX
+                # endpoint can never redirect this public-only client to a
+                # private path or another host.
+                if hasattr(connector,"process_redirect"):
+                    connector.process_redirect=lambda exc: exc
+                async with connector as ws:
                     await ws.send(json.dumps({"op":"subscribe","args":args}))
                     healthy=False
                     async for raw in ws:
@@ -266,13 +418,14 @@ class OKXPublicClient:
             if channel=="tickers":return self.parse_ticker(data[0]) is not None
             if channel=="funding-rate":return bool(self.parse_funding_rows(data,max_future_ms=48*3600_000))
             if channel=="open-interest":return self.parse_open_interest(data[0]) is not None
-            if channel in {"candle1H","candle4H"}:return bool(self.parse_candles(data,"1H" if channel=="candle1H" else "4H"))
+            if channel=="mark-price":return self.parse_mark_price(data[0]) is not None
+            if channel in CHANNEL_TO_TIMEFRAME:return bool(self.parse_candles(data,CHANNEL_TO_TIMEFRAME[channel]))
         except (TypeError,ValueError,IndexError):return False
         return False
 
     async def stream(self,on_message:Callable[[dict],Awaitable[None]],stop:asyncio.Event):
-        public_args=[{"channel":"tickers","instId":"BTC-USDT-SWAP"},{"channel":"funding-rate","instId":"BTC-USDT-SWAP"},{"channel":"open-interest","instId":"BTC-USDT-SWAP"}]
-        candle_args=[{"channel":"candle1H","instId":"BTC-USDT-SWAP"},{"channel":"candle4H","instId":"BTC-USDT-SWAP"}]
+        public_args=[{"channel":"tickers","instId":"BTC-USDT-SWAP"},{"channel":"funding-rate","instId":"BTC-USDT-SWAP"},{"channel":"open-interest","instId":"BTC-USDT-SWAP"},{"channel":"mark-price","instId":"BTC-USDT-SWAP"}]
+        candle_args=[{"channel":str(TIMEFRAME_SPECS[timeframe]["channel"]),"instId":"BTC-USDT-SWAP"} for timeframe in CHART_TIMEFRAMES]
         await asyncio.gather(
             self._stream_endpoint(self.ws_url,public_args,"public",on_message,stop),
             self._stream_endpoint(self.business_ws_url,candle_args,"candles",on_message,stop),
